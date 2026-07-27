@@ -1,0 +1,32 @@
+{
+  "operator_01": {
+    "right": {
+      "abd_open": 51.25305723668175,
+      "abd_mid": 99.77819878160669,
+      "abd_closed": 135.7691393808058,
+      "flex_open": 55.610374450683594,
+      "flex_mid": 15.708091259002686,
+      "flex_closed": -7.195127487182617,
+      "abd_output_open": 0.0,
+      "abd_output_mid": 60.0,
+      "abd_output_closed": 100.0,
+      "flex_output_open": 0.0,
+      "flex_output_mid": 45.0,
+      "flex_output_closed": 55.0
+    },
+    "left": {
+      "abd_open": 43.51233598805921,
+      "abd_mid": 95.01322945765341,
+      "abd_closed": 131.49478128630076,
+      "flex_open": 63.21469497680664,
+      "flex_mid": 26.672956466674805,
+      "flex_closed": -6.394837379455566,
+      "abd_output_open": 0.0,
+      "abd_output_mid": 60.0,
+      "abd_output_closed": 100.0,
+      "flex_output_open": 0.0,
+      "flex_output_mid": 45.0,
+      "flex_output_closed": 55.0
+    }
+  }
+}

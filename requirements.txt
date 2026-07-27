@@ -1,0 +1,5 @@
+numpy>=1.26
+PyYAML>=6.0
+# 正式写入时安装与目标环境一致的 LeRobot 3.x：
+# lerobot>=0.3,<0.5
+

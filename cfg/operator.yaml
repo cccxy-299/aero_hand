@@ -1,0 +1,17 @@
+# 设备 A：只管理操作者设备、目标地址和发送频率。
+network:
+  robot_host: "192.168.1.20"
+  data_port: 17860
+  max_packet_bytes: 65507
+rates:
+  operator_hz: 60
+operator:
+  hand_dof: 16
+  manus:
+    enabled: false
+    address: "tcp://127.0.0.1:9000"
+    topic: "manus"
+  vive:
+    enabled: false
+    left_tracker_role: "left"
+    right_tracker_role: "right"
