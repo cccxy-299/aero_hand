@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Protocol
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 import numpy as np
 
@@ -95,10 +96,6 @@ class DebugJsonlWriter:
 
 class LeRobotV3Writer:
     def __init__(self, cfg: dict[str, Any], schema: dict[str, Any], fps: int) -> None:
-        try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        except ImportError as exc:
-            raise RuntimeError("dataset.writer=lerobot_v3 requires the lerobot package") from exc
         root = Path(cfg["root"])
         if root.exists():
             self.dataset = LeRobotDataset(repo_id=cfg["repo_id"], root=root)
