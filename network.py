@@ -5,9 +5,9 @@ import threading
 import time
 from collections.abc import Callable
 
-from .clock import ClockMapper
-from .model import TimedSample
-from .protocol import Packet
+from clock import ClockMapper
+from model import TimedSample
+from protocol import Packet
 
 
 class UdpSender:

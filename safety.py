@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .model import ControlCommand, TeleopCommand
+from model import ControlCommand, TeleopCommand
 
 FLAG_STALE = 1
 FLAG_WORKSPACE = 2

@@ -5,8 +5,8 @@
 进程内只使用 `time.perf_counter_ns()`，禁止用墙上时间参与对齐。A 包含源单调时间；
 B 使用时钟映射后写入缓冲。帧时刻由 B 的绝对 deadline 驱动，并采用 causal
 sample-and-hold，避免选到“未来”样本。数据集中保存每种模态相对帧时刻的 lag 和
-valid。生产环境应每 1 秒交换一次四时间戳同步包；当前 `ClockMapper` 已实现估计器，
-硬件网络适配时需接上 ping/reply。
+valid。系统每 1 秒执行一次已接入 UDP 通道的四时间戳同步握手，`ClockMapper`
+选择低 RTT 样本的偏移中位数。
 
 ## 安全状态机
 

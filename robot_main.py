@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
-from .runtime import run_robot
-from .config import load_robot_config
+from config import load_robot_config
+from runtime import run_robot
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="设备 B：控制机器人并采集 LeRobot v3 数据集")
-    parser.add_argument("--config", default="teleop_collect/config/robot.yaml")
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "cfg" / "robot.yaml"),
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,

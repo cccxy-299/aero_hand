@@ -1,17 +1,43 @@
-# 设备 A：只管理操作者设备、目标地址和发送频率。
+# 设备 A：MANUS 在本机重定向为7维手指令；VIVE 保持原始位姿发送。
 network:
-  robot_host: "192.168.1.20"
+  robot_host: "172.16.8.86"
   data_port: 17860
   max_packet_bytes: 65507
 rates:
   operator_hz: 60
 operator:
-  hand_dof: 16
+  hardware_enabled: true # 是否启用真机
+  hand_dof: 7
+  max_source_age_ms: 100
   manus:
-    enabled: false
     address: "tcp://127.0.0.1:9000"
     topic: "manus"
+    operator_id: "operator_01"
+    calibration_file: "C:\\cxy\\project_construct_data\\teleop_collect\\thumb_calibration.json"
+    enable_filter: true
+    filter_alpha: 0.8
   vive:
-    enabled: false
-    left_tracker_role: "left"
-    right_tracker_role: "right"
+    left_tracker_name: "T21"
+    right_tracker_name: "T22"
+    survive_args: ["teleop_collect"]
+visualization:
+  enabled: false
+  window_title: "双侧 VIVE 遥操作可视化"
+  update_hz: 60
+  window_width: 1100
+  window_height: 850
+  camera_distance: 3.0
+  camera_elevation: 25
+  camera_azimuth: 45
+  world:
+    axis_length: 1.0
+    grid_size: 4.0
+    grid_spacing: 0.25
+  # 未收到 Lighthouse 实时位姿时使用下列标定值显示。
+  lighthouses:
+    LH0:
+      pos: [-0.9265, 0.9004, 0.7183]
+      quat_wxyz: [-0.2989, -0.2205, 0.5503, 0.7479]
+    LH1:
+      pos: [0.0, 1.4574, 0.5126]
+      quat_wxyz: [-0.0257, -0.0131, 0.6293, 0.7767]

@@ -9,18 +9,18 @@ from typing import Any
 
 import numpy as np
 
-from .adapters import CameraIO, RobotIO
-from .buffer import TimeBuffer
-from .dataset import FrameWriter
-from .model import (
+from adapters import CameraIO, RobotIO
+from buffer import TimeBuffer
+from dataset import FrameWriter
+from model import (
     BimanualControlCommand,
     BimanualRobotState,
     ControlCommand,
     TeleopCommand,
     TimedSample,
 )
-from .protocol import validate_bimanual_payload
-from .safety import SafetyGate
+from retarget import BimanualRetargeter
+from safety import SafetyGate
 
 LOG = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class RobotPipeline:
         cameras: dict[str, CameraIO],
         writer: FrameWriter,
         safety: dict[str, SafetyGate],
+        retargeter: BimanualRetargeter,
         rates: dict[str, Any],
         alignment: dict[str, Any],
         queue_capacity: int = 64,
@@ -54,6 +55,7 @@ class RobotPipeline:
         self.cameras = cameras
         self.writer = writer
         self.safety = safety
+        self.retargeter = retargeter
         capacity = int(alignment["buffer_capacity"])
         # 每路图像拥有独立缓冲，慢相机不会阻塞另一只腕部相机或控制线程。
         buffer_names = (
@@ -72,6 +74,8 @@ class RobotPipeline:
 
     def start(self) -> None:
         self.robot.connect()
+        for camera in self.cameras.values():
+            camera.connect()
         targets = [
             ("control", self._control_loop), ("state", self._state_loop),
             ("frame", self._frame_loop), ("writer", self._writer_loop),
@@ -101,6 +105,8 @@ class RobotPipeline:
                 thread.join(timeout=10)
         self.robot.stop()
         self.robot.disconnect()
+        for camera in self.cameras.values():
+            camera.disconnect()
 
     def _periodic(self, hz: float, callback: Any) -> None:
         period = int(1e9 / hz)
@@ -124,10 +130,9 @@ class RobotPipeline:
             self.metrics.control_ticks += 1
             return
         value = selected.value
-        hand_dof = len(self.safety["left"].cfg.hand_min)
         try:
-            validate_bimanual_payload(value, hand_dof)
-        except ValueError:
+            command = self.retargeter.retarget(value, selected.seq)
+        except (KeyError, TypeError, ValueError):
             # 坏包只计作遥操作失效，不允许异常杀死实时控制线程。
             LOG.warning("丢弃非法双侧遥操作包 seq=%s", selected.seq)
             self.metrics.stale_teleop += 1
@@ -135,15 +140,9 @@ class RobotPipeline:
             return
         safe_by_side: dict[str, ControlCommand] = {}
         for side in ("left", "right"):
-            side_value = value[side]
-            command = TeleopCommand(
-                np.asarray(side_value["arm_pose"], np.float32),
-                np.asarray(side_value["hand_joints"], np.float32),
-                selected.seq,
-                bool(side_value.get("valid", True)),
-            )
+            side_command: TeleopCommand = getattr(command, side)
             safe_by_side[side] = self.safety[side].apply(
-                command, now_ns - selected.local_mono_ns
+                side_command, now_ns - selected.local_mono_ns
             )
         # 左右命令源于同一个网络序列号，作为一份原子命令提交给硬件层。
         safe = BimanualControlCommand(
@@ -167,8 +166,7 @@ class RobotPipeline:
         seq = 0
         def tick(_: int) -> None:
             nonlocal seq
-            image = camera.read()
-            stamp = time.perf_counter_ns()
+            image, stamp = camera.read()
             self.buffers[name].append(TimedSample(name, seq, stamp, stamp, image))
             seq += 1
         self._periodic(float(self.rates["camera_hz"]), tick)

@@ -101,9 +101,10 @@ class LeRobotV3Writer:
             raise RuntimeError("dataset.writer=lerobot_v3 requires the lerobot package") from exc
         root = Path(cfg["root"])
         if root.exists():
-            self.dataset = LeRobotDataset.resume(
-                repo_id=cfg["repo_id"], root=root, image_writer_threads=4, image_writer_processes=0
-            )
+            self.dataset = LeRobotDataset(repo_id=cfg["repo_id"], root=root)
+            # self.dataset = LeRobotDataset.resume(
+            #     repo_id=cfg["repo_id"], root=root, image_writer_threads=4, image_writer_processes=0
+            # )
         else:
             self.dataset = LeRobotDataset.create(
                 repo_id=cfg["repo_id"], root=root, fps=fps,

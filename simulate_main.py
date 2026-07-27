@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
-from .runtime import simulate
-from .config import load_config
+from config import load_config
+from runtime import simulate
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="本机端到端仿真")
-    parser.add_argument("--config", default="teleop_collect/config/demo.yaml")
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "cfg" / "demo.yaml"),
+    )
     parser.add_argument("--seconds", type=float, default=5.0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)

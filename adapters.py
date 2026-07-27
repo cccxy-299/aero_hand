@@ -6,7 +6,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .model import (
+from model import (
     BimanualControlCommand,
     BimanualRobotState,
     BimanualTeleopCommand,
@@ -29,13 +29,15 @@ class RobotIO(Protocol):
 
 
 class CameraIO(Protocol):
-    def read(self) -> np.ndarray: ...
+    def connect(self) -> None: ...
+    def read(self) -> tuple[np.ndarray, int]: ...
+    def disconnect(self) -> None: ...
 
 
 class SimOperator:
     """双侧遥操作仿真源，左右轨迹刻意设置为镜像，便于检查接线。"""
 
-    def __init__(self, hand_dof: int = 16) -> None:
+    def __init__(self, hand_dof: int = 7) -> None:
         self.seq = 0
         self.hand_dof = hand_dof
         self.start = time.perf_counter()
@@ -64,7 +66,7 @@ class SimOperator:
 class SimRobot:
     """双 Piper + 双 Aerohand 的内存仿真适配器。"""
 
-    def __init__(self, hand_dof: int = 16) -> None:
+    def __init__(self, hand_dof: int = 7) -> None:
         self._command = BimanualControlCommand(
             ControlCommand(
                 np.array([0.25, 0.16, 0.25, 0, 0, 0], np.float32),
@@ -105,8 +107,14 @@ class SimCamera:
         self.width, self.height, self.channel = width, height, channel
         self.counter = 0
 
-    def read(self) -> np.ndarray:
+    def connect(self) -> None:
+        pass
+
+    def read(self) -> tuple[np.ndarray, int]:
         image = np.zeros((self.height, self.width, 3), np.uint8)
         image[:, :, self.channel] = self.counter % 255
         self.counter += 1
-        return image
+        return image, time.perf_counter_ns()
+
+    def disconnect(self) -> None:
+        pass

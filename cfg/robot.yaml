@@ -1,4 +1,4 @@
-# 设备 B：管理机器人、相机、安全、对齐和数据集。
+# 设备 B：双 Piper、双 Aerohand、双腕相机及全景相机。
 network:
   data_port: 17860
   max_packet_bytes: 65507
@@ -13,39 +13,54 @@ alignment:
   buffer_capacity: 512
 robot:
   enabled: false
-  hand_dof: 16
+  hand_dof: 7
   left:
-    interface: "can_left"
-    initial_pose: [0.25, 0.16, 0.25, 0.0, 0.0, 0.0]
+    interface: "agx_cando"
+    channel: "0"
+    bitrate: 1000000
+    speed_percent: 20
+    hand_port: "COM18"
+    home_on_connect: false
+    vive_scale: 0.6
+    initial_pose: [0.25, 0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    fixed_orientation: [-1.8968, 0.2201, -1.6187]
     workspace_min: [0.05, 0.00, 0.05]
     workspace_max: [0.40, 0.35, 0.45]
     max_linear_step_m: 0.01
   right:
-    interface: "can_right"
-    initial_pose: [0.25, -0.16, 0.25, 0.0, 0.0, 0.0]
+    interface: "agx_cando"
+    channel: "1"
+    bitrate: 1000000
+    speed_percent: 20
+    hand_port: "COM23"
+    home_on_connect: false
+    vive_scale: 0.6
+    initial_pose: [0.25, -0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    fixed_orientation: [-1.8968, 0.2201, -1.6187]
     workspace_min: [0.05, -0.35, 0.05]
     workspace_max: [0.40, 0.00, 0.45]
     max_linear_step_m: 0.01
-  hand_min: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  hand_max: [90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]
+  hand_min: [0, 0, 0, 0, 0, 0, 0]
+  hand_max: [100, 100, 90, 90, 90, 90, 90]
 cameras:
   width: 640
   height: 480
   wrist_left:
-    enabled: false
     cam_num: 13
     format_idx: 1
   wrist_right:
-    enabled: false
     cam_num: 14
     format_idx: 1
   scene:
-    enabled: false
-    cam_num: 10
-    format_idx: 1
+    driver: "realsense"
+    # 只有连接多台RealSense时才需要填写序列号；单台时可以留空。
+    serial: ""
+    fps: 30
+    timeout_ms: 1000
+    warmup_frames: 10
 dataset:
-  writer: "debug_jsonl"
-  repo_id: "local/piper_aerohand_teleop"
-  root: "./output/piper_aerohand_demo"
-  task: "Teleoperate Piper and Aerohand"
+  writer: "lerobot_v3"
+  repo_id: "local/dual_piper_aerohand"
+  root: "./dataset/dual_piper_aerohand"
+  task: "Bimanual Piper and Aerohand teleoperation"
   queue_capacity: 64

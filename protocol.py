@@ -64,3 +64,22 @@ def validate_bimanual_payload(payload: dict[str, Any], hand_dof: int) -> None:
             raise ValueError(f"{side}.hand_joints must contain {hand_dof} values")
         if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in arm_pose + hand_joints):
             raise ValueError(f"{side} contains non-finite values")
+
+
+def validate_hardware_command_payload(payload: dict[str, Any]) -> None:
+    """校验设备 A 发送的 VIVE 原始位姿与已重定向7维手指令。"""
+
+    for side in ("left", "right"):
+        value = payload.get(side)
+        if not isinstance(value, dict):
+            raise ValueError(f"raw payload missing side: {side}")
+        vive = value.get("vive_pose")
+        hand = value.get("hand_joints")
+        if not isinstance(vive, list) or len(vive) != 7:
+            raise ValueError(f"{side}.vive_pose must contain 7 values")
+        if not isinstance(hand, list) or len(hand) != 7:
+            raise ValueError(f"{side}.hand_joints must contain 7 values")
+        if not all(
+            isinstance(x, (int, float)) and math.isfinite(x) for x in vive + hand
+        ):
+            raise ValueError(f"{side} hardware payload contains non-finite values")

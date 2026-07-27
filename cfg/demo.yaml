@@ -14,25 +14,28 @@ alignment:
   buffer_capacity: 512
 robot:
   enabled: false
-  hand_dof: 16
+  hand_dof: 7
   left:
     initial_pose: [0.25, 0.16, 0.25, 0.0, 0.0, 0.0]
+    fixed_orientation: [0.0, 0.0, 0.0]
     workspace_min: [0.05, 0.00, 0.05]
     workspace_max: [0.40, 0.35, 0.45]
     max_linear_step_m: 0.01
   right:
     initial_pose: [0.25, -0.16, 0.25, 0.0, 0.0, 0.0]
+    fixed_orientation: [0.0, 0.0, 0.0]
     workspace_min: [0.05, -0.35, 0.05]
     workspace_max: [0.40, 0.00, 0.45]
     max_linear_step_m: 0.01
-  hand_min: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  hand_max: [90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]
+  hand_min: [0, 0, 0, 0, 0, 0, 0]
+  hand_max: [100, 100, 90, 90, 90, 90, 90]
 cameras:
   width: 320
   height: 240
 dataset:
-  writer: "debug_jsonl"  # 真机正式采集改为 lerobot_v3
-  repo_id: "local/piper_aerohand_teleop"
-  root: "./output/piper_aerohand_demo"
-  task: "Teleoperate Piper and Aerohand"
+  writer: "debug_jsonl"
+  repo_id: "local/dual_piper_aerohand_demo"
+  root: "./teleop_collect/output/piper_aerohand_demo"
+  task: "Bimanual teleoperation simulation"
   queue_capacity: 64
+

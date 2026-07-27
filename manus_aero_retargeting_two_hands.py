@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import zmq
-from const import AERO_JOINT_LOWER_DEG_16,AERO_JOINT_UPPER_DEG_16,AERO_JOINT_NAMES_16
 from common_cls import LowPass, ManusZmqReader, RetargetingConfig
-try:
-    from manus.thumb_cmc_calibrator import ThumbCMCCalibrator
-except ModuleNotFoundError:
-    # 允许从当前仓库的 “manus glove” 目录直接复用该参考实现。
-    from thumb_cmc_calibrator import ThumbCMCCalibrator
+from const import (
+    AERO_JOINT_LOWER_DEG_16,
+    AERO_JOINT_NAMES_16,
+    AERO_JOINT_UPPER_DEG_16,
+)
+from thumb_cmc_calibrator import ThumbCMCCalibrator
 
 
 

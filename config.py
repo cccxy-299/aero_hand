@@ -28,8 +28,15 @@ def load_operator_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"missing operator config sections: {missing}")
     if float(cfg["rates"]["operator_hz"]) <= 0:
         raise ValueError("rates.operator_hz must be positive")
-    if int(cfg["operator"]["hand_dof"]) <= 0:
-        raise ValueError("operator.hand_dof must be positive")
+    if int(cfg["operator"]["hand_dof"]) != 7:
+        raise ValueError("operator.hand_dof 必须为 7")
+    manus = cfg["operator"].get("manus", {})
+    for name in ("address", "topic", "operator_id", "calibration_file"):
+        if name not in manus:
+            raise ValueError(f"operator.manus.{name} is required")
+    visual = cfg.get("visualization", {})
+    if "update_hz" in visual and float(visual["update_hz"]) <= 0:
+        raise ValueError("visualization.update_hz must be positive")
     return cfg
 
 
@@ -49,4 +56,15 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for camera in ("scene", "wrist_left", "wrist_right"):
         if camera not in cfg["cameras"]:
             raise ValueError(f"cameras.{camera} is required")
+    scene = cfg["cameras"]["scene"]
+    if scene.get("driver") != "realsense":
+        raise ValueError("cameras.scene.driver 必须为 realsense")
+    if int(scene.get("fps", cfg["rates"]["camera_hz"])) <= 0:
+        raise ValueError("cameras.scene.fps must be positive")
+    if int(scene.get("timeout_ms", 1000)) <= 0:
+        raise ValueError("cameras.scene.timeout_ms must be positive")
+    if int(cfg["robot"]["hand_dof"]) != 7:
+        raise ValueError("robot.hand_dof 必须为 7")
+    if len(cfg["robot"]["hand_min"]) != 7 or len(cfg["robot"]["hand_max"]) != 7:
+        raise ValueError("robot.hand_min/hand_max 必须各包含 7 个值")
     return cfg

@@ -1,5 +1,14 @@
 numpy>=1.26
 PyYAML>=6.0
+pyzmq>=25
+opencv-python>=4.8
+# Intel RealSense 全景彩色相机（也可使用 librealsense 自带的安装包）：
+# pyrealsense2>=2.55
+# 设备 A 可视化（仅 --visualize 时需要）：
+# pyqtgraph>=0.13
+# PyOpenGL>=3.1
+# PySide6>=6.5
 # 正式写入时安装与目标环境一致的 LeRobot 3.x：
 # lerobot>=0.3,<0.5
-
+# 设备 A 真机：pyzmq、pysurvive/libsurvive
+# 设备 B 真机：pyAgxArm、aero_open_sdk、pyvizionsdk、opencv-python

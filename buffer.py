@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-from .model import TimedSample
+from model import TimedSample
 
 T = TypeVar("T")
 
@@ -49,4 +49,3 @@ class TimeBuffer:
             return Selection(None, 2**63 - 1, False)
         lag = target_ns - selected.local_mono_ns
         return Selection(selected, lag, selected.valid and lag <= max_lag_ns)
-
