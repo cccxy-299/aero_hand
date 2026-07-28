@@ -14,7 +14,8 @@ from pyvizionsdk import VX_IMAGE_FORMAT, VX_ISP_IMAGE_PROPERTIES
 # ============================================================
 
 camera_num_to_serial_number: Dict[int, str] = {
-    10: "VCI-AR0234-C-ADF11",
+    0: "'XY-GS-Camera: XY-GS-Camera (/dev/video0)'",
+    2: "'XY-GS-Camera: XY-GS-Camera (/dev/video2)'",
     11: "VCI-AR0234-C-25D59",
     12: "VCI-AR0234-C-1C982",
     13: "VCS-AR0234-C-B1C8A",
@@ -482,6 +483,7 @@ if __name__ == "__main__":
         target_width=1280,
         target_height=720,
     )
+    scene_cam.connect()
 
     # wrist_cam = CameraInterface(
     #     cam_num=11,
