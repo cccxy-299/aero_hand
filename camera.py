@@ -14,8 +14,8 @@ from pyvizionsdk import VX_IMAGE_FORMAT, VX_ISP_IMAGE_PROPERTIES
 # ============================================================
 
 camera_num_to_serial_number: Dict[int, str] = {
-    0: "'XY-GS-Camera: XY-GS-Camera (/dev/video0)'",
-    2: "'XY-GS-Camera: XY-GS-Camera (/dev/video2)'",
+    0: "XY-GS-Camera: XY-GS-Camera (/dev/video0)",
+    1: "XY-GS-Camera: XY-GS-Camera (/dev/video2)",
     11: "VCI-AR0234-C-25D59",
     12: "VCI-AR0234-C-1C982",
     13: "VCS-AR0234-C-B1C8A",
@@ -256,7 +256,7 @@ class CameraInterface:
         )
 
         pyvizionsdk.VxSetFormat(camera, fmt)
-        self._apply_isp_defaults(camera)
+        # self._apply_isp_defaults(camera)
         pyvizionsdk.VxStartStreaming(camera)
 
         return camera, fmt

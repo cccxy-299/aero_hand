@@ -24,6 +24,11 @@ from retarget import (
     PassthroughRetargeter,
     SideRetargetConfig,
 )
+from hardware_adapters import (
+            DualPiperAerohand,
+            IntelRealSenseColorCamera,
+            TechNexionCamera,
+        )
 from safety import SafetyConfig, SafetyGate
 
 
@@ -47,11 +52,6 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpRe
             np.asarray(side_cfg["initial_pose"], np.float32),
         )
     if bool(cfg["robot"]["enabled"]):
-        from hardware_adapters import (
-            DualPiperAerohand,
-            IntelRealSenseColorCamera,
-            TechNexionCamera,
-        )
 
         robot_adapter = DualPiperAerohand(cfg["robot"])
         camera_adapters = {
@@ -168,7 +168,12 @@ def run_robot(cfg: dict) -> None:
     pipeline, receiver = make_pipeline(cfg, True)
     assert receiver
     network_thread = threading.Thread(target=receiver.run, name="udp-receiver", daemon=True)
+    # try:
     pipeline.start()
+    # finally:
+    #     print("结束进程")
+    #     receiver.close()
+    #     pipeline.stop()
     network_thread.start()
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())

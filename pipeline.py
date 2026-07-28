@@ -131,6 +131,7 @@ class RobotPipeline:
             return
         value = selected.value
         try:
+            # 执行命令
             command = self.retargeter.retarget(value, selected.seq)
         except (KeyError, TypeError, ValueError):
             # 坏包只计作遥操作失效，不允许异常杀死实时控制线程。

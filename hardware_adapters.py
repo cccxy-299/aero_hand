@@ -92,6 +92,7 @@ class DualPiperAerohand:
         for side in ("left", "right"):
             print(f"{side} 侧设备连接中！")
             side_cfg = self.cfg[side]
+
             arm_config = create_agx_arm_config(
                 robot=ArmModel.PIPER,
                 firmeware_version=PiperFW.DEFAULT,
@@ -99,22 +100,21 @@ class DualPiperAerohand:
                 channel=str(side_cfg.get("channel", "0")),
                 bitrate=int(side_cfg.get("bitrate", 1_000_000)),
             )
+            print(f"{side} 侧 机械臂 连接中~~~~~")
             arm = AgxArmFactory.create_arm(arm_config)
             arm.connect()
-            print(f"{side} 侧 机械臂 连接中~~~~~")
             deadline = time.monotonic() + float(side_cfg.get("enable_timeout_s", 5))
-            while not arm.enable():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"{side} Piper 使能超时")
-                time.sleep(0.05)
+            # while not arm.enable():
+            #     if time.monotonic() >= deadline:
+            #         raise RuntimeError(f"{side} Piper 使能超时")
+            #     time.sleep(0.05)
             arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
             self.arms[side] = arm
-
             hand = AeroHand(port=side_cfg["hand_port"])
             self.hands[side] = hand
             print(f"{side} 侧 灵巧手 连接中~~~~~")
             if bool(side_cfg.get("home_on_connect", False)):
-                arm.move_p(side_cfg["initial_pose"])
+                arm.move_j(side_cfg["initial_pose"])
                 hand.send_homing()
             print(f"{side} 侧 设备连接成功~~~~")
 
@@ -128,12 +128,16 @@ class DualPiperAerohand:
 
     def _send_arm(self, side: str, value: np.ndarray) -> None:
         with self.arm_locks[side]:
-            self.arms[side].move_p(value.tolist())
+            # TODO: 打印并未执行
+            print(f"动作执行，hardware_adapter, _send_arm() side: {side}, value: {value}")
+            # self.arms[side].move_p(value.tolist())
 
     def _send_hand(self, side: str, value: np.ndarray) -> None:
         if value.shape != (7,):
             raise ValueError(f"{side} Aerohand 控制指令必须为7维，实际为 {value.shape}")
-        self.hands[side].set_joint_positions(value.tolist())
+        # TODO: 打印并未执行
+        print(f"动作执行，hardware_adapter, _send_hand() side: {side}, value: {value}" )
+        # self.hands[side].set_joint_positions(value.tolist())
 
         state = self.hands[side].get_joint_positions_compact() # 获取7位
         state = np.asarray(state, np.float32)
@@ -164,6 +168,8 @@ class DualPiperAerohand:
             arm = self.arms.get(side)
             if arm is not None:
                 try:
+                    # arm.disable()
+                    time.sleep(3)
                     arm.disconnect()
                 except Exception:
                     LOG.exception("%s Piper 断开失败", side)

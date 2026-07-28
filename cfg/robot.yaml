@@ -12,30 +12,31 @@ alignment:
   teleop_timeout_ms: 150
   buffer_capacity: 512
 robot:
-  enabled: false
+  enabled: true
   hand_dof: 7
   left:
-    interface: "agx_cando"
-    channel: "0"
+    interface: "socketcan"
+    channel: "can_left"
     bitrate: 1000000
     speed_percent: 20
-    hand_port: "COM18"
+    hand_port: "/dev/ttyACM1"
     home_on_connect: false
-    vive_scale: 0.6
-    initial_pose: [0.25, 0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    vive_scale: 0.3
+    initial_pose: [0, 0, 0, 0 , 0.2201, -1.6187]
     fixed_orientation: [-1.8968, 0.2201, -1.6187]
     workspace_min: [0.05, 0.00, 0.05]
     workspace_max: [0.40, 0.35, 0.45]
     max_linear_step_m: 0.01
   right:
-    interface: "agx_cando"
-    channel: "1"
+    # linux :socketcan can1; windows:agx_cando, 1
+    interface: "socketcan"
+    channel: "can_right"
     bitrate: 1000000
     speed_percent: 20
-    hand_port: "COM23"
+    hand_port: "/dev/ttyACM0"
     home_on_connect: false
-    vive_scale: 0.6
-    initial_pose: [0.25, -0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    vive_scale: 0.3
+    initial_pose: [0, 0, 0, 0, 0.2201, -1.6187]
     fixed_orientation: [-1.8968, 0.2201, -1.6187]
     workspace_min: [0.05, -0.35, 0.05]
     workspace_max: [0.40, 0.00, 0.45]
@@ -46,10 +47,10 @@ cameras:
   width: 640
   height: 480
   wrist_left:
-    cam_num: 13
+    cam_num: 0
     format_idx: 1
   wrist_right:
-    cam_num: 14
+    cam_num: 1
     format_idx: 1
   scene:
     driver: "realsense"

@@ -98,10 +98,10 @@ class LeRobotV3Writer:
     def __init__(self, cfg: dict[str, Any], schema: dict[str, Any], fps: int) -> None:
         root = Path(cfg["root"])
         if root.exists():
-            self.dataset = LeRobotDataset(repo_id=cfg["repo_id"], root=root)
-            # self.dataset = LeRobotDataset.resume(
-            #     repo_id=cfg["repo_id"], root=root, image_writer_threads=4, image_writer_processes=0
-            # )
+            # self.dataset = LeRobotDataset(repo_id=cfg["repo_id"], root=root)
+            self.dataset = LeRobotDataset.resume(
+                repo_id=cfg["repo_id"], root=root, image_writer_threads=4, image_writer_processes=0
+            )
         else:
             self.dataset = LeRobotDataset.create(
                 repo_id=cfg["repo_id"], root=root, fps=fps,
