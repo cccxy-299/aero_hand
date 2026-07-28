@@ -11,16 +11,12 @@ from manus_aero_retargeting_two_hands import (
     ManusToAeroRetargeter,
 )
 from thumb_cmc_calibrator import ThumbCMCCalibrator
+import pysurvive
 
 
 class DualViveReader:
     """设备 A 的双 VIVE Tracker 后台采集器。"""
-
     def __init__(self, tracker_names: dict[str, str], survive_args: list[str] | None = None) -> None:
-        try:
-            import pysurvive
-        except ImportError as exc:
-            raise RuntimeError("启用 VIVE 真机需要安装 pysurvive/libsurvive") from exc
         self._context = pysurvive.SimpleContext(survive_args or ["teleop_collect"])
         self._tracker_to_side = {name: side for side, name in tracker_names.items()}
         self._latest: dict[str, tuple[list[float], int]] = {}

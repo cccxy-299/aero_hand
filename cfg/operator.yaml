@@ -19,9 +19,10 @@ operator:
   vive:
     left_tracker_name: "T21"
     right_tracker_name: "T22"
-    survive_args: ["teleop_collect"]
+    #  --force-calibrate ： 重新标定，基站移动就需要加这个参数
+    survive_args: ['--v', '10']
 visualization:
-  enabled: false
+  enabled: true
   window_title: "双侧 VIVE 遥操作可视化"
   update_hz: 60
   window_width: 1100

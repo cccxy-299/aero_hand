@@ -90,6 +90,7 @@ class DualPiperAerohand:
             ) from exc
 
         for side in ("left", "right"):
+            print(f"{side} 侧设备连接中！")
             side_cfg = self.cfg[side]
             arm_config = create_agx_arm_config(
                 robot=ArmModel.PIPER,
@@ -100,6 +101,7 @@ class DualPiperAerohand:
             )
             arm = AgxArmFactory.create_arm(arm_config)
             arm.connect()
+            print(f"{side} 侧 机械臂 连接中~~~~~")
             deadline = time.monotonic() + float(side_cfg.get("enable_timeout_s", 5))
             while not arm.enable():
                 if time.monotonic() >= deadline:
@@ -110,9 +112,11 @@ class DualPiperAerohand:
 
             hand = AeroHand(port=side_cfg["hand_port"])
             self.hands[side] = hand
+            print(f"{side} 侧 灵巧手 连接中~~~~~")
             if bool(side_cfg.get("home_on_connect", False)):
                 arm.move_p(side_cfg["initial_pose"])
                 hand.send_homing()
+            print(f"{side} 侧 设备连接成功~~~~")
 
         for side in ("left", "right"):
             self.workers[f"arm_{side}"] = LatestCommandWorker(
