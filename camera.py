@@ -142,6 +142,7 @@ class CameraInterface:
         warmup_timeout_s: float = 5.0,
         strict_fps: bool = True,
         fps_tolerance: float = 1.0,
+        background_capture: bool = True,
     ):
         self.cam_num = cam_num
         self.fps = fps
@@ -156,6 +157,9 @@ class CameraInterface:
         self.warmup_timeout_s = warmup_timeout_s
         self.strict_fps = strict_fps
         self.fps_tolerance = float(fps_tolerance)
+        # 多进程采集时关闭内部线程，由相机子进程主线程直接阻塞读取。
+        # 即使厂商 SDK 持有 GIL，也只会阻塞当前相机进程。
+        self.background_capture = bool(background_capture)
 
         self.logger = logging.getLogger(self.name)
 
@@ -176,7 +180,7 @@ class CameraInterface:
 
     def connect(self):
         """
-        连接并启动摄像头后台采集线程。
+        连接相机；可选择后台线程缓存或由当前相机进程直接阻塞读取。
         """
 
         # 如果还没有检测过设备，则自动检测一次
@@ -200,18 +204,21 @@ class CameraInterface:
 
         self.camera, self.format = self._init_tn_camera(self.index)
 
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._capture_loop,
-            daemon=True,
-            name=self.name,
-        )
-        self._thread.start()
-
-        self.logger.info(f"{self.name} capture thread started.")
-
-        # 等待第一帧，避免刚启动时 get_rgb() 返回 None
-        self._wait_first_frame()
+        if self.background_capture:
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True,
+                name=self.name,
+            )
+            self._thread.start()
+            self.logger.info(f"{self.name} capture thread started.")
+            # 后台模式等待第一帧，避免 connect() 返回后立即读到空值。
+            self._wait_first_frame()
+        else:
+            self.logger.info(
+                "%s uses direct blocking capture in the camera process.", self.name
+            )
 
     def disconnect(self):
         """
@@ -233,7 +240,7 @@ class CameraInterface:
 
     def _init_tn_camera(self, index: int):
         """
-        初始化 TechNexion 摄像头，并选择 UYVY 格式。
+        初始化 TechNexion 摄像头，并选择 MJPG 格式。
         """
         camera = pyvizionsdk.VxInitialCameraDevice(index)
         pyvizionsdk.VxOpen(camera)
@@ -339,35 +346,15 @@ class CameraInterface:
 
         while self._running:
             try:
-                result, image = pyvizionsdk.VxGetImage(
-                    self.camera,
-                    self.timeout_ms,
-                    self.format,
-                )
-
-                # frame_bgr = decode_uyvy(
-                #     image,
-                #     width=self.format.width,
-                #     height=self.format.height,
-                # )
-                frame_bgr = decode_mjpg(image)
-
+                frame_bgr = self._read_bgr_blocking()
                 if frame_bgr is None:
                     bad_count += 1
                     if bad_count % 100 == 0:
                         self.logger.warning(
-                            f"Failed to decode UYVY frame. "
+                            f"Failed to decode MJPG frame. "
                             f"bad_count={bad_count}, ok_count={ok_count}"
                         )
                     continue
-
-                # 如果数据集要求固定分辨率，则 resize
-                if self.target_width is not None and self.target_height is not None:
-                    frame_bgr = cv2.resize(
-                        frame_bgr,
-                        (self.target_width, self.target_height),
-                        interpolation=cv2.INTER_AREA,
-                    )
 
                 ok_count += 1
                 frame_timestamp = time.perf_counter()
@@ -380,6 +367,26 @@ class CameraInterface:
                 if bad_count % 20 == 0:
                     self.logger.warning(f"Camera capture exception: {e}")
                 time.sleep(0.01)
+
+    def _read_bgr_blocking(self) -> Optional[np.ndarray]:
+        """从厂商 SDK 阻塞读取并解码一帧，仅由一个线程调用。"""
+        if self.camera is None or self.format is None:
+            raise RuntimeError(f"{self.name} 尚未连接")
+        _, image = pyvizionsdk.VxGetImage(
+            self.camera,
+            self.timeout_ms,
+            self.format,
+        )
+        frame_bgr = decode_mjpg(image)
+        if frame_bgr is None:
+            return None
+        if self.target_width is not None and self.target_height is not None:
+            frame_bgr = cv2.resize(
+                frame_bgr,
+                (self.target_width, self.target_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        return frame_bgr
 
     def _wait_first_frame(self):
         """
@@ -435,12 +442,19 @@ class CameraInterface:
             frame_rgb: np.ndarray, shape = (H, W, 3), dtype = uint8
             timestamp: float, Unix 时间戳，单位秒
         """
-        with self._lock:
-            if self._frame_bgr is None:
-                raise RuntimeError(f"{self.name} 尚未采集到图像")
+        if not self.background_capture:
+            frame_bgr = self._read_bgr_blocking()
+            if frame_bgr is None:
+                raise RuntimeError(f"{self.name} MJPG 解码失败")
+            # 时间戳取帧抵达设备 B 相机进程的单调时钟。
+            timestamp = time.perf_counter()
+        else:
+            with self._lock:
+                if self._frame_bgr is None:
+                    raise RuntimeError(f"{self.name} 尚未采集到图像")
 
-            frame_bgr = self._frame_bgr.copy()
-            timestamp = self._frame_timestamp
+                frame_bgr = self._frame_bgr.copy()
+                timestamp = self._frame_timestamp
 
         if timestamp is None:
             raise RuntimeError(f"{self.name} 尚未记录图像时间戳")

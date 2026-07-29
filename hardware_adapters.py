@@ -218,6 +218,8 @@ class TechNexionCamera:
             target_height=height,
             strict_fps=bool(cfg.get("strict_fps", True)),
             fps_tolerance=float(cfg.get("fps_tolerance", 1.0)),
+            # 每路相机已由独立 OS 进程承载，不再在进程内套采集线程。
+            background_capture=bool(cfg.get("background_capture", False)),
         )
 
     def connect(self) -> None:

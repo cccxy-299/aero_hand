@@ -26,6 +26,9 @@ episode:
   min_frames: 10
   save_on_shutdown: true
   command_queue_capacity: 32
+  # start 等待三路独立相机进程就绪；stop 超时后会强制回收卡死的 SDK 进程。
+  camera_start_timeout_s: 15
+  camera_shutdown_timeout_s: 5
   # 任一路相机低于这些质量门限时自动丢弃 episode，避免把卡顿视频用于训练。
   min_camera_fps: 24
   min_camera_unique_ratio: 0.70
@@ -71,11 +74,14 @@ cameras:
     format_idx: null
     strict_fps: true
     fps_tolerance: 1.0
+    # 相机已经隔离到独立进程，进程内部不要再套一层 Python 采集线程。
+    background_capture: false
   wrist_right:
     cam_num: 1
     format_idx: null
     strict_fps: true
     fps_tolerance: 1.0
+    background_capture: false
   scene:
     driver: "realsense"
     # 只有连接多台RealSense时才需要填写序列号；单台时可以留空。
