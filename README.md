@@ -54,9 +54,42 @@ python -m pip install -r requirements-visualization.txt
 当前入口使用本目录内的模块引用，因此请先进入 `teleop_collect` 目录，再运行设备 A、
 设备 B 或仿真入口。
 
-按 `Ctrl+C` 安全停止。`cfg/robot.yaml` 和 `cfg/operator.yaml` 默认选择真机适配器。
+按 `Ctrl+C` 安全停止；若 episode 正在录制，默认先保存该 episode 再退出。
+`cfg/robot.yaml` 和 `cfg/operator.yaml` 默认选择真机适配器。
 首次调试建议复制配置并暂时设置 `robot.enabled: false`、`operator.hardware_enabled:
 false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐项使能。
+
+## Episode 人工控制
+
+设备 B 启动完成后，三路相机和机器人控制保持运行，但默认不写数据。在
+`robot_main` 所在终端输入：
+
+```text
+start
+start Pick up the red block
+stop
+discard
+status
+quit
+```
+
+- `start [可选任务描述]`：开始一个新 episode。
+- `stop`：停止当前 episode，等待三路视频、Parquet 和元数据保存完成。
+- `discard`：丢弃当前 episode，不增加 episode 编号。
+- `status`：输出当前状态、帧数和已有 episode 数。
+- `quit`：保存正在录制的 episode（由 `save_on_shutdown` 控制）并退出。
+
+保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
+就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。
+
+视觉 feature 的 dtype 已设置为 `video`，最终数据位于 LeRobot v3 的 `videos/`
+目录并使用 MP4。支持 `streaming_encoding` 的新版 LeRobot 会在采集时直接编码；
+LeRobot 0.4 会先暂存 PNG，在 `stop` 时编码为 MP4，最终训练数据仍是视频格式。
+
+再次启动时，程序以 `meta/info.json` 判断是否为有效数据集。新版调用 `resume()`；
+LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前配置不一致时会拒绝
+追加，避免静默破坏数据集。相对 `dataset.root` 固定解析到 `teleop_collect` 目录，
+不会因启动时工作目录不同而写入另一个位置。
 
 ## 多进程与数据流
 

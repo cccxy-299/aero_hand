@@ -18,7 +18,14 @@ runtime:
   ipc_queue_capacity: 2048
   status_queue_capacity: 128
   shutdown_timeout_s: 8
-  writer_shutdown_timeout_s: 15
+  writer_shutdown_timeout_s: 60
+episode:
+  # 默认不录制；在 robot_main 终端输入 start 后才开始一个 episode。
+  interactive: true
+  auto_start: false
+  min_frames: 10
+  save_on_shutdown: true
+  command_queue_capacity: 32
 robot:
   enabled: true
   hand_dof: 7
@@ -73,3 +80,8 @@ dataset:
   root: "./dataset/dual_piper_aerohand"
   task: "Bimanual Piper and Aerohand teleoperation"
   queue_capacity: 64
+  # 新版 LeRobot 直接流式编码 MP4；0.4 版本会自动回退为临时 PNG -> stop 时编码 MP4。
+  streaming_encoding: true
+  encoder_queue_maxsize: 90
+  image_writer_processes: 2
+  image_writer_threads: 2

@@ -346,30 +346,48 @@ def _build_frame(
 
 
 def _recorder_process(
-    cfg: dict[str, Any], stop_event: Any, sample_queue: Any, status_queue: Any
+    cfg: dict[str, Any],
+    stop_event: Any,
+    sample_queue: Any,
+    episode_queue: Any,
+    status_queue: Any,
 ) -> None:
-    """采集进程：三路相机、时间对齐、组帧、图像编码和 LeRobot 写盘。"""
+    """采集进程：相机常开，只有 recording 状态才构建并写入 episode。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [device-b/recorder] %(message)s",
     )
     _configure_child_signals(stop_event)
-    # 延迟导入，确保控制进程不加载 LeRobot/PyAV/编码器依赖。
     from dataset import feature_schema, make_writer
 
+    episode_cfg = cfg.get("episode", {})
+    min_frames = int(episode_cfg.get("min_frames", 10))
+    save_on_shutdown = bool(episode_cfg.get("save_on_shutdown", True))
     buffers = {
         name: TimeBuffer(int(cfg["alignment"]["buffer_capacity"]))
         for name in ALIGNMENT_NAMES
     }
-    writer_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+    # 写队列既传帧也传 episode 边界；FIFO 保证 stop 之前的帧先写入。
+    writer_queue: queue.Queue[tuple[str, Any]] = queue.Queue(
         int(cfg["dataset"]["queue_capacity"])
     )
-    metrics = {"frame_ticks": 0, "written_frames": 0, "writer_drops": 0}
+    writer_results: queue.Queue[dict[str, Any]] = queue.Queue()
+    metrics = {
+        "frame_ticks": 0,
+        "written_frames": 0,
+        "writer_drops": 0,
+        "saved_episodes": 0,
+        "discarded_episodes": 0,
+    }
     cameras: dict[str, Any] = {}
     connected_cameras: list[str] = []
     worker_threads: list[threading.Thread] = []
     writer = None
     writer_thread: threading.Thread | None = None
+    episode_state = "idle"
+    episode_session = 0
+    episode_frames = 0
+    episode_task = str(cfg["dataset"]["task"])
 
     def fail(component: str, exc: BaseException) -> None:
         _status_put(
@@ -381,6 +399,107 @@ def _recorder_process(
             traceback=traceback.format_exc(),
         )
         stop_event.set()
+
+    def publish_episode_status(kind: str, **values: Any) -> None:
+        _status_put(
+            status_queue,
+            "recorder",
+            kind,
+            state=episode_state,
+            session=episode_session,
+            frames=episode_frames,
+            total_episodes=writer.total_episodes if writer is not None else 0,
+            **values,
+        )
+
+    def enqueue_boundary(kind: str, payload: dict[str, Any]) -> None:
+        # episode 边界不能丢；它不在控制进程中，允许短暂等待写队列腾出空间。
+        writer_queue.put((kind, payload), timeout=5)
+
+    def start_episode(task: str | None = None) -> None:
+        nonlocal episode_state, episode_session, episode_frames, episode_task
+        if episode_state != "idle":
+            publish_episode_status(
+                "episode_rejected", command="start", reason=f"state={episode_state}"
+            )
+            return
+        episode_session += 1
+        episode_frames = 0
+        episode_task = task.strip() if task and task.strip() else str(cfg["dataset"]["task"])
+        enqueue_boundary(
+            "begin",
+            {"session": episode_session, "task": episode_task},
+        )
+        episode_state = "recording"
+        publish_episode_status(
+            "episode_started", task=episode_task, video_mode=writer.video_mode
+        )
+
+    def finish_episode(save: bool, reason: str) -> None:
+        nonlocal episode_state
+        if episode_state != "recording":
+            publish_episode_status(
+                "episode_rejected",
+                command="stop" if save else "discard",
+                reason=f"state={episode_state}",
+            )
+            return
+        should_save = save and episode_frames >= min_frames
+        command = "save" if should_save else "discard"
+        episode_state = "saving" if should_save else "discarding"
+        enqueue_boundary(
+            command,
+            {
+                "session": episode_session,
+                "frames": episode_frames,
+                "reason": reason,
+            },
+        )
+        publish_episode_status(
+            "episode_stopping",
+            requested_save=save,
+            action=command,
+            reason=reason,
+        )
+
+    def drain_writer_results() -> None:
+        nonlocal episode_state
+        while True:
+            try:
+                result = writer_results.get_nowait()
+            except queue.Empty:
+                return
+            kind = result["kind"]
+            if kind == "saved":
+                episode_state = "idle"
+                metrics["saved_episodes"] += 1
+                publish_episode_status(
+                    "episode_saved",
+                    episode_index=result["episode_index"],
+                    saved_frames=result["frames"],
+                )
+            elif kind == "discarded":
+                episode_state = "idle"
+                metrics["discarded_episodes"] += 1
+                publish_episode_status(
+                    "episode_discarded", discarded_frames=result["frames"]
+                )
+
+    def handle_episode_commands() -> None:
+        while True:
+            try:
+                command = episode_queue.get_nowait()
+            except queue.Empty:
+                return
+            kind = str(command.get("kind", "")).lower()
+            if kind == "start":
+                start_episode(command.get("task"))
+            elif kind == "stop":
+                finish_episode(True, "manual")
+            elif kind == "discard":
+                finish_episode(False, "manual")
+            elif kind == "status":
+                publish_episode_status("episode_status", task=episode_task)
 
     try:
         cameras = _make_cameras(cfg)
@@ -414,9 +533,7 @@ def _recorder_process(
                     )
                     seq += 1
 
-                _periodic(
-                    stop_event, float(cfg["rates"]["camera_hz"]), read_camera
-                )
+                _periodic(stop_event, float(cfg["rates"]["camera_hz"]), read_camera)
             except BaseException as exc:
                 if not stop_event.is_set():
                     fail(name, exc)
@@ -424,11 +541,28 @@ def _recorder_process(
         def writer_loop() -> None:
             try:
                 while True:
-                    frame = writer_queue.get()
-                    if frame is None:
+                    kind, payload = writer_queue.get()
+                    if kind == "close":
                         break
-                    writer.add_frame(frame)
-                    metrics["written_frames"] += 1
+                    if kind == "begin":
+                        writer.begin_episode(payload["task"])
+                    elif kind == "frame":
+                        writer.add_frame(payload)
+                        metrics["written_frames"] += 1
+                    elif kind == "save":
+                        episode_index = writer.save_episode()
+                        writer_results.put(
+                            {
+                                "kind": "saved",
+                                "episode_index": episode_index,
+                                "frames": payload["frames"],
+                            }
+                        )
+                    elif kind == "discard":
+                        writer.discard_episode()
+                        writer_results.put(
+                            {"kind": "discarded", "frames": payload["frames"]}
+                        )
             except BaseException as exc:
                 fail("dataset_writer", exc)
             finally:
@@ -453,31 +587,45 @@ def _recorder_process(
         for thread in worker_threads:
             thread.start()
 
-        _status_put(status_queue, "recorder", "ready", cameras=list(CAMERA_NAMES))
+        _status_put(
+            status_queue,
+            "recorder",
+            "ready",
+            cameras=list(CAMERA_NAMES),
+            existing_episodes=writer.total_episodes,
+            video_mode=writer.video_mode,
+        )
+        if bool(episode_cfg.get("auto_start", False)):
+            start_episode()
+
         max_lag_ns = int(float(cfg["alignment"]["max_lag_ms"]) * 1e6)
         frame_period_ns = int(1e9 / float(cfg["rates"]["frame_hz"]))
         deadline_ns = time.perf_counter_ns()
         last_report_ns = deadline_ns
         while not stop_event.is_set():
-            frame = _build_frame(buffers, time.perf_counter_ns(), max_lag_ns)
-            if frame is not None:
-                try:
-                    writer_queue.put_nowait(frame)
-                except queue.Full:
+            handle_episode_commands()
+            drain_writer_results()
+            if episode_state == "recording":
+                frame = _build_frame(buffers, time.perf_counter_ns(), max_lag_ns)
+                if frame is not None:
                     try:
-                        writer_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        writer_queue.put_nowait(frame)
+                        writer_queue.put_nowait(("frame", frame))
+                        episode_frames += 1
                     except queue.Full:
-                        pass
-                    metrics["writer_drops"] += 1
-                metrics["frame_ticks"] += 1
+                        # 只丢当前新帧，绝不从队列中误删 begin/save 边界。
+                        metrics["writer_drops"] += 1
+                    metrics["frame_ticks"] += 1
 
             now_ns = time.perf_counter_ns()
             if now_ns - last_report_ns >= 1_000_000_000:
-                _status_put(status_queue, "recorder", "metrics", metrics=dict(metrics))
+                _status_put(
+                    status_queue,
+                    "recorder",
+                    "metrics",
+                    metrics=dict(metrics),
+                    episode_state=episode_state,
+                    episode_frames=episode_frames,
+                )
                 last_report_ns = now_ns
             deadline_ns += frame_period_ns
             remaining_ns = deadline_ns - time.perf_counter_ns()
@@ -492,18 +640,28 @@ def _recorder_process(
         for thread in worker_threads:
             if thread.name != "dataset-writer":
                 thread.join(timeout=3)
+
         if writer is not None and writer_thread is not None:
+            if episode_state == "recording":
+                finish_episode(save_on_shutdown, "shutdown")
+            shutdown_deadline = time.monotonic() + float(
+                cfg.get("runtime", {}).get("writer_shutdown_timeout_s", 30)
+            )
+            while episode_state in {"saving", "discarding"} and time.monotonic() < shutdown_deadline:
+                drain_writer_results()
+                time.sleep(0.02)
+            if episode_state in {"saving", "discarding"}:
+                fail(
+                    "episode_shutdown",
+                    TimeoutError("episode 在退出期限内未完成保存/丢弃"),
+                )
             try:
-                writer_queue.put(None, timeout=1)
+                writer_queue.put(("close", None), timeout=1)
             except queue.Full:
-                try:
-                    writer_queue.get_nowait()
-                    writer_queue.put_nowait(None)
-                except (queue.Empty, queue.Full):
-                    pass
+                fail("dataset_writer_shutdown", TimeoutError("无法提交 writer close"))
             writer_thread.join(
                 timeout=float(
-                    cfg.get("runtime", {}).get("writer_shutdown_timeout_s", 15)
+                    cfg.get("runtime", {}).get("writer_shutdown_timeout_s", 30)
                 )
             )
             if writer_thread.is_alive():
@@ -512,33 +670,43 @@ def _recorder_process(
                     TimeoutError("数据集写线程未在限定时间内完成刷新"),
                 )
         elif writer is not None:
-            # 相机启动失败发生在写线程创建之前时，也必须释放数据集资源。
             try:
                 writer.close()
             except BaseException as exc:
                 fail("dataset_finalize", exc)
+
         for name in reversed(connected_cameras):
             try:
                 cameras[name].disconnect()
             except Exception:
                 LOG.exception("%s 相机断开失败", name)
-        _status_put(status_queue, "recorder", "stopped", metrics=dict(metrics))
+        _status_put(
+            status_queue,
+            "recorder",
+            "stopped",
+            metrics=dict(metrics),
+            total_episodes=writer.total_episodes if writer is not None else 0,
+        )
 
 
 def run_robot_multiprocess(
     cfg: dict[str, Any], run_seconds: float | None = None
 ) -> None:
-    """设备 B 多进程入口；父进程只负责监督和统一退出。"""
+    """设备 B 父进程：监督两个子进程，并提供人工 episode 控制台。"""
+    import sys
+
     runtime_cfg = cfg.get("runtime", {})
+    episode_cfg = cfg.get("episode", {})
     ctx = mp.get_context("spawn")
     stop_event = ctx.Event()
     sample_queue = ctx.Queue(maxsize=int(runtime_cfg.get("ipc_queue_capacity", 2048)))
+    episode_queue = ctx.Queue(maxsize=int(episode_cfg.get("command_queue_capacity", 32)))
     status_queue = ctx.Queue(maxsize=int(runtime_cfg.get("status_queue_capacity", 128)))
     processes = {
         "recorder": ctx.Process(
             name="device-b-recorder",
             target=_recorder_process,
-            args=(cfg, stop_event, sample_queue, status_queue),
+            args=(cfg, stop_event, sample_queue, episode_queue, status_queue),
         ),
         "control": ctx.Process(
             name="device-b-control",
@@ -551,11 +719,42 @@ def run_robot_multiprocess(
     def request_stop(*_: Any) -> None:
         stop_event.set()
 
+    def submit_episode_command(kind: str, task: str | None = None) -> None:
+        try:
+            episode_queue.put_nowait({"kind": kind, "task": task})
+        except queue.Full:
+            LOG.error("episode 命令队列已满，命令被拒绝：%s", kind)
+
+    def console_loop() -> None:
+        LOG.info(
+            "Episode 控制：start [任务描述] | stop | discard | status | quit"
+        )
+        while not stop_event.is_set():
+            line = sys.stdin.readline()
+            if line == "":
+                return
+            command, _, value = line.strip().partition(" ")
+            command = command.lower()
+            if command in {"start", "stop", "discard", "status"}:
+                submit_episode_command(command, value or None)
+            elif command in {"quit", "exit", "q"}:
+                stop_event.set()
+                return
+            elif command:
+                LOG.warning("未知命令：%s", command)
+
     old_sigint = signal.signal(signal.SIGINT, request_stop)
     old_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    console_thread: threading.Thread | None = None
     try:
         processes["recorder"].start()
         processes["control"].start()
+        if bool(episode_cfg.get("interactive", True)):
+            console_thread = threading.Thread(
+                target=console_loop, name="episode-console", daemon=True
+            )
+            console_thread.start()
+
         end_time = None if run_seconds is None else time.monotonic() + run_seconds
         while not stop_event.is_set():
             if end_time is not None and time.monotonic() >= end_time:
@@ -563,7 +762,8 @@ def run_robot_multiprocess(
                 break
             try:
                 status = status_queue.get(timeout=0.5)
-                if status.get("kind") == "error":
+                kind = status.get("kind")
+                if kind == "error":
                     errors.append(status)
                     LOG.error(
                         "%s 子进程失败（%s）：%s",
@@ -572,10 +772,12 @@ def run_robot_multiprocess(
                         status.get("error"),
                     )
                     stop_event.set()
-                elif status.get("kind") == "ready":
-                    LOG.info("%s 子进程已就绪", status.get("process"))
-                elif status.get("kind") == "metrics":
+                elif kind == "ready":
+                    LOG.info("%s 子进程已就绪：%s", status.get("process"), status)
+                elif kind == "metrics":
                     LOG.info("%s", json.dumps(status, ensure_ascii=False))
+                elif str(kind).startswith("episode_"):
+                    LOG.info("EPISODE %s", json.dumps(status, ensure_ascii=False))
             except queue.Empty:
                 pass
 
@@ -599,25 +801,26 @@ def run_robot_multiprocess(
                     )
                     stop_event.set()
     finally:
-        # stop_event.set()
-        # shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
-        # for process in processes.values():
-        #     if process.pid is not None:
-        #         process.join(timeout=shutdown_timeout_s)
-        # for process in processes.values():
-        #     if process.is_alive():
-        #         LOG.error(
-        #             "%s 未在 %.1fs 内退出，执行强制终止",
-        #             process.name,
-        #             shutdown_timeout_s,
-        #         )
-        #         process.terminate()
-        #         process.join(timeout=3)
-        #         if process.is_alive():
-        #             LOG.error("%s 仍未退出，执行 kill", process.name)
-        #             process.kill()
-        #             process.join(timeout=2)
-        # 子进程可能先设置共享停止事件再投递错误；退出前必须排空诊断队列。
+        stop_event.set()
+        shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
+        # recorder 可能正在编码视频，给它更长的优雅退出时间。
+        recorder_timeout_s = float(
+            runtime_cfg.get("writer_shutdown_timeout_s", 30)
+        ) + shutdown_timeout_s
+        for name, process in processes.items():
+            if process.pid is not None:
+                process.join(
+                    timeout=recorder_timeout_s if name == "recorder" else shutdown_timeout_s
+                )
+        for process in processes.values():
+            if process.is_alive():
+                LOG.error("%s 优雅退出超时，执行 terminate", process.name)
+                process.terminate()
+                process.join(timeout=3)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2)
+
         while True:
             try:
                 status = status_queue.get_nowait()
@@ -631,10 +834,9 @@ def run_robot_multiprocess(
                     status.get("component", "runtime"),
                     status.get("error"),
                 )
-        sample_queue.close()
-        sample_queue.cancel_join_thread()
-        status_queue.close()
-        status_queue.cancel_join_thread()
+        for ipc_queue in (sample_queue, episode_queue, status_queue):
+            ipc_queue.close()
+            ipc_queue.cancel_join_thread()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
 

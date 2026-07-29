@@ -35,7 +35,6 @@ cameras:
 dataset:
   writer: "debug_jsonl"
   repo_id: "local/dual_piper_aerohand_demo"
-  root: "./teleop_collect/output/piper_aerohand_demo"
+  root: "./output/piper_aerohand_demo"
   task: "Bimanual teleoperation simulation"
   queue_capacity: 64
-

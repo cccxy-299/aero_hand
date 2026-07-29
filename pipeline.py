@@ -76,6 +76,8 @@ class RobotPipeline:
         self.robot.connect()
         for camera in self.cameras.values():
             camera.connect()
+        # 单进程 simulate 入口自动录制一个 episode；真机入口使用显式状态机。
+        self.writer.begin_episode()
         targets = [
             ("control", self._control_loop), ("state", self._state_loop),
             ("frame", self._frame_loop), ("writer", self._writer_loop),
@@ -229,15 +231,17 @@ class RobotPipeline:
         self.metrics.frame_ticks += 1
 
     def _writer_loop(self) -> None:
-        while True:
-            item = self.write_queue.get()
-            if item is None:
-                break
-            try:
+        try:
+            while True:
+                item = self.write_queue.get()
+                if item is None:
+                    break
                 self.writer.add_frame(item)
                 self.metrics.written_frames += 1
-            except Exception:
-                LOG.exception("dataset writer failed")
-                self.stop_event.set()
-                break
-        self.writer.close()
+        except Exception:
+            LOG.exception("dataset writer failed")
+            self.stop_event.set()
+        finally:
+            if self.writer.pending_frames() > 0:
+                self.writer.save_episode()
+            self.writer.close()

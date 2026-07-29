@@ -16,6 +16,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     for name in ("operator_hz", "control_hz", "state_hz", "camera_hz", "frame_hz"):
         if float(cfg["rates"][name]) <= 0:
             raise ValueError(f"rates.{name} must be positive")
+    dataset_root = Path(cfg["dataset"]["root"])
+    if not dataset_root.is_absolute():
+        dataset_root = Path(__file__).resolve().parent / dataset_root
+    cfg["dataset"]["root"] = str(dataset_root.resolve())
     return cfg
 
 
@@ -41,7 +45,8 @@ def load_operator_config(path: str | Path) -> dict[str, Any]:
 
 
 def load_robot_config(path: str | Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    config_path = Path(path).resolve()
+    with config_path.open("r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
     required = ["network", "rates", "dataset", "robot", "cameras", "alignment"]
     missing = [key for key in required if key not in cfg]
@@ -76,4 +81,13 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for name in ("shutdown_timeout_s", "writer_shutdown_timeout_s"):
         if float(runtime.get(name, 1)) <= 0:
             raise ValueError(f"runtime.{name} must be positive")
+    episode = cfg.setdefault("episode", {})
+    for name, default in (("min_frames", 10), ("command_queue_capacity", 32)):
+        if int(episode.get(name, default)) <= 0:
+            raise ValueError(f"episode.{name} must be positive")
+    dataset_root = Path(cfg["dataset"]["root"])
+    if not dataset_root.is_absolute():
+        # 固定相对于代码目录解析，避免两次启动时因 cwd 不同写到两个数据集。
+        dataset_root = Path(__file__).resolve().parent / dataset_root
+    cfg["dataset"]["root"] = str(dataset_root.resolve())
     return cfg
