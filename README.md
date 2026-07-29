@@ -179,6 +179,49 @@ VizionSDK 的单次失败返回码、空 MJPEG buffer 或损坏 JPEG 只会丢�
 `camera_failure_timeout_ms`（默认 1500 ms）没有任何有效图像才会停止系统。这样既
 不会因一个 USB 瞬时坏包误停机，也不会在相机真正离线后继续控制和保存坏数据。
 
+### 双相机并发诊断
+
+`camera_concurrency_test.py` 完全不启动机器人、LeRobot Writer、RealSense或视频
+编码器，只测试两台 TechNexion 的 VizionSDK 取流。真机排查时依次执行：
+
+```bash
+# 1. 各自单测30秒
+python camera_concurrency_test.py --mode single-left --duration-s 30
+python camera_concurrency_test.py --mode single-right --duration-s 30
+
+# 2. 同一进程、两个线程（接近旧Demo结构）
+python camera_concurrency_test.py --mode dual-thread --duration-s 30
+
+# 3. 两个独立进程（与正式采集结构一致）
+python camera_concurrency_test.py --mode dual-process --duration-s 30
+
+# 4. 模拟正式程序的30Hz轮询；默认 poll-hz=0 会尽快持续排空SDK
+python camera_concurrency_test.py --mode dual-process --poll-hz 30 --duration-s 30
+
+# 5. 扫描左/右相机报告的每个MJPG format
+python camera_concurrency_test.py --mode sweep-left --sweep-duration-s 10
+python camera_concurrency_test.py --mode sweep-right --sweep-duration-s 10
+```
+
+若已从启动日志确认稳定的格式索引，可显式比较，例如：
+
+```bash
+python camera_concurrency_test.py \
+  --mode dual-process \
+  --left-format-idx 1 \
+  --right-format-idx 1 \
+  --no-strict-fps \
+  --timeout-ms 1000 \
+  --duration-s 60
+```
+
+每秒输出一条JSON `progress`，结束输出 `summary` 和 `verdict`。重点查看
+`sdk_timeout`、`source_fps`、`error_ratio`、`max_gap_ms` 和
+`max_consecutive_errors`。单测均正常但 `dual-thread` 失败，优先检查SDK双设备或USB；
+`dual-thread` 正常而 `dual-process` 失败，优先检查VizionSDK跨进程兼容性；
+默认持续取流正常但 `--poll-hz 30` 失败，说明SDK需要持续排空，正式相机进程不应额外
+限频；只有部分 format 稳定时，应在 `robot.yaml` 固定各自已验证的索引。
+
 ## Intel RealSense 全景相机
 
 设备 B 的 `cameras.scene` 使用 `driver: realsense`。单台 RealSense 时可将
