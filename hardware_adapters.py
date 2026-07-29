@@ -154,8 +154,13 @@ class DualPiperAerohand:
         states: dict[str, RobotState] = {}
         for side in ("left", "right"):
             with self.arm_locks[side]:
-                flange = np.asarray(self.arms[side].get_flange_pose().msg, np.float32)
-                joints = np.asarray(self.arms[side].get_joint_angles().msg, np.float32)
+                fp = self.arms[side].get_flange_pose()
+                ja = self.arms[side].get_joint_angles()
+                if fp is not None:
+                    flange = np.asarray(fp.msg, np.float32)
+                if ja is not None:
+                    joints = np.asarray(ja.msg, np.float32)
+
             states[side] = RobotState(flange, joints, self.last_hand[side].copy())
         return BimanualRobotState(states["left"], states["right"])
 
@@ -168,7 +173,7 @@ class DualPiperAerohand:
             arm = self.arms.get(side)
             if arm is not None:
                 try:
-                    # arm.disable()
+                    arm.disable()
                     time.sleep(3)
                     arm.disconnect()
                 except Exception:

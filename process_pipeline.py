@@ -599,24 +599,24 @@ def run_robot_multiprocess(
                     )
                     stop_event.set()
     finally:
-        stop_event.set()
-        shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
-        for process in processes.values():
-            if process.pid is not None:
-                process.join(timeout=shutdown_timeout_s)
-        for process in processes.values():
-            if process.is_alive():
-                LOG.error(
-                    "%s 未在 %.1fs 内退出，执行强制终止",
-                    process.name,
-                    shutdown_timeout_s,
-                )
-                process.terminate()
-                process.join(timeout=3)
-                if process.is_alive():
-                    LOG.error("%s 仍未退出，执行 kill", process.name)
-                    process.kill()
-                    process.join(timeout=2)
+        # stop_event.set()
+        # shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
+        # for process in processes.values():
+        #     if process.pid is not None:
+        #         process.join(timeout=shutdown_timeout_s)
+        # for process in processes.values():
+        #     if process.is_alive():
+        #         LOG.error(
+        #             "%s 未在 %.1fs 内退出，执行强制终止",
+        #             process.name,
+        #             shutdown_timeout_s,
+        #         )
+        #         process.terminate()
+        #         process.join(timeout=3)
+        #         if process.is_alive():
+        #             LOG.error("%s 仍未退出，执行 kill", process.name)
+        #             process.kill()
+        #             process.join(timeout=2)
         # 子进程可能先设置共享停止事件再投递错误；退出前必须排空诊断队列。
         while True:
             try:
