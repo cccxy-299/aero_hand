@@ -30,7 +30,7 @@ episode:
   camera_start_timeout_s: 15
   camera_shutdown_timeout_s: 5
   # 瞬时空包/损坏帧只丢当前帧；持续无有效画面超过该时间才停止整个 episode。
-  camera_failure_timeout_ms: 1500
+  camera_failure_timeout_ms: 2500
   camera_retry_delay_ms: 10
   camera_error_report_interval: 30
   # 任一路相机低于这些质量门限时自动丢弃 episode，避免把卡顿视频用于训练。

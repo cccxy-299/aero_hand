@@ -132,14 +132,15 @@ class DualPiperAerohand:
     def _send_arm(self, side: str, value: np.ndarray) -> None:
         with self.arm_locks[side]:
             # TODO: 打印并未执行
-            print(f"动作执行，hardware_adapter, _send_arm() side: {side}, value: {value}")
+            pass
+            # print(f"动作执行，hardware_adapter, _send_arm() side: {side}, value: {value}")
             # self.arms[side].move_p(value.tolist())
 
     def _send_hand(self, side: str, value: np.ndarray) -> None:
         if value.shape != (7,):
             raise ValueError(f"{side} Aerohand 控制指令必须为7维，实际为 {value.shape}")
         # TODO: 打印并未执行
-        print(f"动作执行，hardware_adapter, _send_hand() side: {side}, value: {value}" )
+        # print(f"动作执行，hardware_adapter, _send_hand() side: {side}, value: {value}" )
         # self.hands[side].set_joint_positions(value.tolist())
 
         state = self.hands[side].get_joint_positions_compact() # 获取7位
@@ -157,6 +158,8 @@ class DualPiperAerohand:
         states: dict[str, RobotState] = {}
         for side in ("left", "right"):
             with self.arm_locks[side]:
+                flange = None
+                joints = None
                 fp = self.arms[side].get_flange_pose()
                 ja = self.arms[side].get_joint_angles()
                 if fp is not None:

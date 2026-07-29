@@ -229,6 +229,7 @@ class LeRobotV3Writer:
             "streaming_encoding": streaming_requested,
             "encoder_queue_maxsize": int(cfg.get("encoder_queue_maxsize", 90)),
             "encoder_threads": cfg.get("encoder_threads"),
+            "vcodec": "h264",
         }
 
         if dataset_exists:

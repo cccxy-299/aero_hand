@@ -118,11 +118,7 @@ def detect_connected_cameras() -> List[int]:
     """
     logger = logging.getLogger("detect_cameras")
 
-    result, connected_serials = pyvizionsdk.VxDiscoverCameraDevices()
-    if not _sdk_call_succeeded(result):
-        raise RuntimeError(
-            f"VxDiscoverCameraDevices 失败: result={result!r}"
-        )
+    _, connected_serials = pyvizionsdk.VxDiscoverCameraDevices()
     logger.info(f"Connected serials: {connected_serials}")
 
     connected_cam_nums: List[int] = []
