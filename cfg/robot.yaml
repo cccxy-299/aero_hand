@@ -11,6 +11,14 @@ alignment:
   max_lag_ms: 80
   teleop_timeout_ms: 150
   buffer_capacity: 512
+runtime:
+  # 固定使用 spawn，避免 Linux fork 继承 CAN、串口、USB 和 UDP 的内部状态。
+  process_model: "spawn"
+  # IPC 只传递遥操作、机器人状态和动作等小对象，绝不传图像。
+  ipc_queue_capacity: 2048
+  status_queue_capacity: 128
+  shutdown_timeout_s: 8
+  writer_shutdown_timeout_s: 15
 robot:
   enabled: true
   hand_dof: 7

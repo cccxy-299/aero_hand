@@ -165,25 +165,11 @@ def operator(
 
 
 def run_robot(cfg: dict) -> None:
-    pipeline, receiver = make_pipeline(cfg, True)
-    assert receiver
-    network_thread = threading.Thread(target=receiver.run, name="udp-receiver", daemon=True)
-    # try:
-    pipeline.start()
-    # finally:
-    #     print("结束进程")
-    #     receiver.close()
-    #     pipeline.stop()
-    network_thread.start()
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    try:
-        while not stop.wait(1):
-            print(json.dumps(pipeline.metrics.__dict__))
-    finally:
-        receiver.close()
-        pipeline.stop()
+    # 真机入口固定使用 spawn 多进程。控制进程不会与图像编码、磁盘写入争用 GIL，
+    # 也不会继承父进程中预先打开的 UDP、CAN、串口或 USB 句柄。
+    from process_pipeline import run_robot_multiprocess
+
+    run_robot_multiprocess(cfg)
 
 
 def simulate(cfg: dict, seconds: float) -> None:

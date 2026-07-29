@@ -9,9 +9,9 @@ MANUS/VIVE，在设备 A 将 MANUS 重定向成左右各7维灵巧手控制指�
 ## 快速验证
 
 ```powershell
-python -m pip install -r teleop_collect/requirements.txt
-python -m teleop_collect.simulate_main --config teleop_collect/cfg/demo.yaml --seconds 5
-python -m unittest discover -s teleop_collect/tests -v
+cd teleop_collect
+python -m pip install -r requirements.txt
+python simulate_main.py --config cfg/demo.yaml --seconds 5
 ```
 
 `simulate` 默认使用 `debug_jsonl` 写入器，便于在没有 LeRobot/FFmpeg 的开发机上
@@ -22,23 +22,25 @@ python -m unittest discover -s teleop_collect/tests -v
 设备 B 先启动：
 
 ```powershell
-python -m teleop_collect.robot_main --config teleop_collect/cfg/robot.yaml
+cd teleop_collect
+python robot_main.py --config cfg/robot.yaml
 ```
 
 设备 A 再启动：
 
 ```powershell
-python -m teleop_collect.operator_main --config teleop_collect/cfg/operator.yaml
+cd teleop_collect
+python operator_main.py --config cfg/operator.yaml
 ```
 
 设备 A 可选择开启或关闭 VIVE 三维可视化：
 
 ```powershell
 # 命令行显式开启
-python -m teleop_collect.operator_main --config teleop_collect/cfg/operator.yaml --visualize
+python operator_main.py --config cfg/operator.yaml --visualize
 
 # 显式关闭，适用于无桌面环境
-python -m teleop_collect.operator_main --config teleop_collect/cfg/operator.yaml --no-visualize
+python operator_main.py --config cfg/operator.yaml --no-visualize
 ```
 
 未传参数时使用 `operator.yaml` 中的 `visualization.enabled`。开启可视化需要额外安装
@@ -46,33 +48,32 @@ python -m teleop_collect.operator_main --config teleop_collect/cfg/operator.yaml
 MANUS 重定向、网络发送或机器人控制。
 
 ```powershell
-python -m pip install -r teleop_collect/requirements-visualization.txt
+python -m pip install -r requirements-visualization.txt
 ```
 
-项目内部统一使用 `teleop_collect.*` 绝对引用，因此建议始终在项目根目录使用
-上述 `python -m teleop_collect...` 命令启动。
+当前入口使用本目录内的模块引用，因此请先进入 `teleop_collect` 目录，再运行设备 A、
+设备 B 或仿真入口。
 
 按 `Ctrl+C` 安全停止。`cfg/robot.yaml` 和 `cfg/operator.yaml` 默认选择真机适配器。
 首次调试建议复制配置并暂时设置 `robot.enabled: false`、`operator.hardware_enabled:
 false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐项使能。
 
-## 线程与数据流
+## 多进程与数据流
 
 ```text
 设备 A: 左右MANUS/VIVE采集 -> MANUS双手7维重定向 -> 同一seq/mono_ns -> UDP
-设备 B: UDP接收 -> 时钟映射 -> teleop有界缓冲
-                      |
-                100 Hz 控制线程 -> 左右独立安全门 -> 双Piper/双Aerohand
-                      |
- 全景/左腕/右腕相机线程 + 双侧状态线程 -> 各自有界时间缓冲
-                      |
-                30 Hz 帧组装线程 -> 有界写入队列
-                                           |
-                                  LeRobot写入线程/视频编码
+设备 B 父进程: 信号处理、子进程监督、统一退出
+        |
+        +-- 控制进程: UDP/时钟映射 -> 100 Hz重定向/安全门 -> 双Piper/双Aerohand
+        |                                |
+        |                        有界IPC（仅小型状态/动作）
+        |                                |
+        +-- 采集进程: 三路相机 -> 时间缓冲 -> 30 Hz组帧 -> LeRobot编码/写盘
 ```
 
-控制线程从不调用图像编码、磁盘写入或预览。队列溢出采用丢弃旧帧并计数，不反压
-控制线程。原始源时间、映射时间、选择样本的 lag/valid、网络序列号均进入诊断特征。
+设备 B 固定使用 `spawn`，控制进程不会加载相机或 LeRobot 编码依赖。原始图像不跨
+进程传输；IPC 只传递遥操作、机器人状态和最终动作。队列溢出时丢弃旧样本并计数，
+不反压控制循环。原始源时间、映射时间、选择样本的 lag/valid、网络序列号均进入诊断特征。
 
 ## 已实现的真机适配器
 

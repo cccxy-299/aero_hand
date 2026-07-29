@@ -67,4 +67,13 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("robot.hand_dof 必须为 7")
     if len(cfg["robot"]["hand_min"]) != 7 or len(cfg["robot"]["hand_max"]) != 7:
         raise ValueError("robot.hand_min/hand_max 必须各包含 7 个值")
+    runtime = cfg.get("runtime", {})
+    if runtime.get("process_model", "spawn") != "spawn":
+        raise ValueError("runtime.process_model 必须为 spawn")
+    for name in ("ipc_queue_capacity", "status_queue_capacity"):
+        if int(runtime.get(name, 1)) <= 0:
+            raise ValueError(f"runtime.{name} must be positive")
+    for name in ("shutdown_timeout_s", "writer_shutdown_timeout_s"):
+        if float(runtime.get(name, 1)) <= 0:
+            raise ValueError(f"runtime.{name} must be positive")
     return cfg

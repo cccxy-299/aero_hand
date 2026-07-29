@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Protocol
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
 import numpy as np
 
 
@@ -96,6 +94,9 @@ class DebugJsonlWriter:
 
 class LeRobotV3Writer:
     def __init__(self, cfg: dict[str, Any], schema: dict[str, Any], fps: int) -> None:
+        # 多进程模式下只有采集/写盘进程需要加载 LeRobot 及编码依赖。
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
         root = Path(cfg["root"])
         if root.exists():
             # self.dataset = LeRobotDataset(repo_id=cfg["repo_id"], root=root)
