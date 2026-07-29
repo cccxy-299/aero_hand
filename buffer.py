@@ -42,6 +42,16 @@ class TimeBuffer:
         with self._lock:
             return self._items[-1] if self._items else None
 
+    def clear(self) -> None:
+        """开始新会话前清空旧样本，禁止跨 episode 复用历史状态或图像。"""
+        with self._lock:
+            self._items.clear()
+            self.dropped = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
     def select_before(self, target_ns: int, max_lag_ns: int) -> Selection:
         with self._lock:
             selected = next((x for x in reversed(self._items) if x.local_mono_ns <= target_ns), None)

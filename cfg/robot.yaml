@@ -79,7 +79,8 @@ dataset:
   repo_id: "local/dual_piper_aerohand"
   root: "./dataset/dual_piper_aerohand"
   task: "Bimanual Piper and Aerohand teleoperation"
-  queue_capacity: 64
+  # 允许 Writer 短时抖动约 8 秒；满时仍丢新帧并在 episode 诊断中报告。
+  queue_capacity: 256
   # 新版 LeRobot 直接流式编码 MP4；0.4 版本会自动回退为临时 PNG -> stop 时编码 MP4。
   streaming_encoding: true
   encoder_queue_maxsize: 90

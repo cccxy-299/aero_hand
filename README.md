@@ -61,7 +61,8 @@ false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐�
 
 ## Episode 人工控制
 
-设备 B 启动完成后，三路相机和机器人控制保持运行，但默认不写数据。在
+设备 B 启动完成后处于 `idle`：机器人、CAN/串口和三路相机均未连接，控制循环与
+相机线程也未启动；仅保留父进程、UDP/时钟同步监听和阻塞式命令队列。在
 `robot_main` 所在终端输入：
 
 ```text
@@ -79,6 +80,11 @@ quit
 - `status`：输出当前状态、帧数和已有 episode 数。
 - `quit`：保存正在录制的 episode（由 `save_on_shutdown` 控制）并退出。
 
+`start` 会先连接并确认三路相机，再连接双 Piper/双 Aerohand 并启动状态、控制和
+组帧循环。`stop`/`discard` 会立即停止机器人控制、关闭相机线程并释放设备；
+`stop` 随后保存 episode，`discard` 则清理临时帧。下一次 `start` 会建立全新的硬件
+会话和时间缓冲，旧 episode 的图像、state 或 action 不会被复用。
+
 保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
 就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。
 
@@ -90,6 +96,14 @@ LeRobot 0.4 会先暂存 PNG，在 `stop` 时编码为 MP4，最终训练数据�
 LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前配置不一致时会拒绝
 追加，避免静默破坏数据集。相对 `dataset.root` 固定解析到 `teleop_collect` 目录，
 不会因启动时工作目录不同而写入另一个位置。
+
+每次 `episode_saved` 日志都会输出完整帧链路诊断：
+
+- `camera_scene/wrist_left/wrist_right`：每路相机实际进入时间缓冲的唯一帧数。
+- `frame_attempts` 与 `incomplete_frames`：30 Hz 组帧尝试数和输入尚未齐全的次数。
+- `grouped_frames`、`writer_frames`、`dataset_frame_delta`：组帧、Writer 缓冲及
+  LeRobot 元数据实际增加的帧数；三者不一致时程序直接报错并停止。
+- `writer_drops`：Writer 队列拥塞导致的丢帧数。
 
 ## 多进程与数据流
 

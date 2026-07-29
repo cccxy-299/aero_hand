@@ -121,6 +121,7 @@ class DebugJsonlWriter:
         self.task = task
         self.handle: Any | None = None
         self._pending_frames = 0
+        self.last_save_report: dict[str, Any] = {}
 
     def begin_episode(self, task: str | None = None) -> None:
         if self.handle is not None:
@@ -145,8 +146,14 @@ class DebugJsonlWriter:
         self.handle.close()
         self.handle = None
         saved_index = self.total_episodes
+        saved_frames = self._pending_frames
         self.total_episodes += 1
         self._pending_frames = 0
+        self.last_save_report = {
+            "episode_index": saved_index,
+            "dataset_frame_delta": saved_frames,
+            "total_episodes": self.total_episodes,
+        }
         self._write_summary()
         return saved_index
 
@@ -197,6 +204,7 @@ class LeRobotV3Writer:
         self.root = Path(cfg["root"]).resolve()
         self.task = str(cfg["task"])
         self._episode_open = False
+        self.last_save_report: dict[str, Any] = {}
         info_path = self.root / "meta" / "info.json"
         dataset_exists = info_path.is_file()
 
@@ -315,17 +323,32 @@ class LeRobotV3Writer:
         if not self._episode_open or pending <= 0:
             raise RuntimeError("当前 episode 没有可保存的帧")
         saved_index = int(self.dataset.meta.total_episodes)
+        frames_before = int(self.dataset.meta.total_frames)
         save_values: dict[str, Any] = {}
         if "parallel_encoding" in inspect.signature(self.dataset.save_episode).parameters:
             save_values["parallel_encoding"] = True
         self.dataset.save_episode(**save_values)
         actual_total = int(self.dataset.meta.total_episodes)
+        frames_after = int(self.dataset.meta.total_frames)
         if actual_total != saved_index + 1:
             raise RuntimeError(
                 f"episode 元数据未递增：before={saved_index}, after={actual_total}"
             )
+        if frames_after - frames_before != pending:
+            raise RuntimeError(
+                "LeRobot 元数据帧增量与 Writer 缓冲不一致："
+                f"metadata_delta={frames_after - frames_before}, pending={pending}"
+            )
         self.total_episodes = actual_total
         self._episode_open = False
+        self.last_save_report = {
+            "episode_index": saved_index,
+            "pending_frames": pending,
+            "dataset_frame_delta": frames_after - frames_before,
+            "total_frames": frames_after,
+            "total_episodes": actual_total,
+            "video_mode": self.video_mode,
+        }
         return saved_index
 
     def discard_episode(self) -> None:

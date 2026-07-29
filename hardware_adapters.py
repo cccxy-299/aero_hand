@@ -81,6 +81,9 @@ class DualPiperAerohand:
         self.last_command: BimanualControlCommand | None = None
 
     def connect(self) -> None:
+        # 同一适配器允许跨 episode 重新连接；旧会话容器必须已经由 disconnect 清空。
+        if self.arms or self.hands or self.workers:
+            raise RuntimeError("机器人适配器仍持有上一会话资源，拒绝重复 connect")
         try:
             from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
             from aero_open_sdk.aero_hand import AeroHand
@@ -165,8 +168,9 @@ class DualPiperAerohand:
         return BimanualRobotState(states["left"], states["right"])
 
     def stop(self) -> None:
-        for worker in self.workers.values():
+        for worker in list(self.workers.values()):
             worker.close()
+        self.workers.clear()
 
     def disconnect(self) -> None:
         for side in ("left", "right"):
@@ -178,6 +182,16 @@ class DualPiperAerohand:
                     arm.disconnect()
                 except Exception:
                     LOG.exception("%s Piper 断开失败", side)
+        self.arms.clear()
+        for side, hand in list(self.hands.items()):
+            try:
+                if hasattr(hand, "close"):
+                    hand.close()
+                elif hasattr(hand, "disconnect"):
+                    hand.disconnect()
+            except Exception:
+                LOG.exception("%s Aerohand 断开失败", side)
+        self.hands.clear()
 
 
 class TechNexionCamera:

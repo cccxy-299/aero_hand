@@ -120,9 +120,13 @@ def _make_control_components(cfg: dict[str, Any]) -> tuple[Any, Any, dict[str, S
 
 
 def _control_process(
-    cfg: dict[str, Any], stop_event: Any, sample_queue: Any, status_queue: Any
+    cfg: dict[str, Any],
+    stop_event: Any,
+    sample_queue: Any,
+    control_queue: Any,
+    status_queue: Any,
 ) -> None:
-    """控制进程：UDP、重定向、安全门、机器人命令和状态读取。"""
+    """控制进程：空闲时只监听 UDP/命令，start 后才连接并控制机器人。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [device-b/control] %(message)s",
@@ -136,21 +140,154 @@ def _control_process(
         "state_ticks": 0,
         "stale_teleop": 0,
         "control_overruns": 0,
+        "control_sessions": 0,
     }
     robot = None
+    retargeter = None
+    safety = None
+    active = False
     receiver = None
     receiver_thread: threading.Thread | None = None
     state_thread: threading.Thread | None = None
+    state_stop: threading.Event | None = None
 
     def ingest(sample: TimedSample) -> None:
-        if sample.source == "teleop":
+        # 空闲时只完成网络时钟同步，不积压无效遥操作样本。
+        if sample.source == "teleop" and active:
             teleop_buffer.append(sample)
             _put_latest(sample_queue, sample)
 
+    def deactivate(reason: str) -> None:
+        nonlocal robot, retargeter, safety, active, state_thread, state_stop
+        if not active and robot is None:
+            return
+        # 先关闭控制入口，再停止状态读取和硬件工作线程。
+        active = False
+        if state_stop is not None:
+            state_stop.set()
+        if state_thread is not None:
+            state_thread.join(timeout=3)
+        if robot is not None:
+            try:
+                robot.stop()
+            except Exception:
+                LOG.exception("机器人停止失败")
+            try:
+                robot.disconnect()
+            except Exception:
+                LOG.exception("机器人断开失败")
+        robot = None
+        retargeter = None
+        safety = None
+        state_thread = None
+        state_stop = None
+        teleop_buffer.clear()
+        _status_put(
+            status_queue,
+            "control",
+            "control_stopped",
+            reason=reason,
+            metrics=dict(metrics),
+        )
+
+    def activate() -> None:
+        nonlocal robot, retargeter, safety, active, state_thread, state_stop
+        if active:
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command="start",
+                reason="already_active",
+            )
+            return
+        candidate = None
+        try:
+            candidate, candidate_retargeter, candidate_safety = _make_control_components(cfg)
+            candidate.connect()
+            robot = candidate
+            retargeter = candidate_retargeter
+            safety = candidate_safety
+            teleop_buffer.clear()
+            state_stop = threading.Event()
+
+            def state_loop(
+                session_robot: Any, session_stop: threading.Event
+            ) -> None:
+                state_seq = 0
+
+                def read_state(_: int) -> None:
+                    nonlocal state_seq
+                    stamp_ns = time.perf_counter_ns()
+                    state = session_robot.read_state()
+                    _put_latest(
+                        sample_queue,
+                        TimedSample(
+                            "robot_state", state_seq, stamp_ns, stamp_ns, state
+                        ),
+                    )
+                    state_seq += 1
+                    metrics["state_ticks"] += 1
+
+                try:
+                    _periodic(
+                        session_stop, float(cfg["rates"]["state_hz"]), read_state
+                    )
+                except BaseException as exc:
+                    _status_put(
+                        status_queue,
+                        "control",
+                        "error",
+                        component="robot_state",
+                        error=repr(exc),
+                        traceback=traceback.format_exc(),
+                    )
+                    stop_event.set()
+
+            active = True
+            state_thread = threading.Thread(
+                target=state_loop,
+                args=(robot, state_stop),
+                name="robot-state",
+                daemon=True,
+            )
+            state_thread.start()
+            metrics["control_sessions"] += 1
+            _status_put(
+                status_queue,
+                "control",
+                "control_started",
+                session=metrics["control_sessions"],
+            )
+        except BaseException:
+            if candidate is not None:
+                try:
+                    candidate.stop()
+                except Exception:
+                    pass
+                try:
+                    candidate.disconnect()
+                except Exception:
+                    pass
+            raise
+
+    def handle_command(command: dict[str, Any]) -> None:
+        kind = str(command.get("kind", "")).lower()
+        if kind == "start":
+            activate()
+        elif kind in {"stop", "discard"}:
+            deactivate(kind)
+        elif kind == "status":
+            _status_put(
+                status_queue,
+                "control",
+                "control_status",
+                active=active,
+                metrics=dict(metrics),
+            )
+
     try:
-        robot, retargeter, safety = _make_control_components(cfg)
-        # 先连接机器人，再绑定 UDP；机器人启动失败时不会占住端口。
-        robot.connect()
+        # UDP/时钟同步是空闲态唯一常驻 I/O，不会触发机器人动作。
         receiver = UdpReceiver(
             int(cfg["network"]["data_port"]),
             ClockMapper(),
@@ -161,42 +298,34 @@ def _control_process(
             target=receiver.run, name="udp-receiver", daemon=True
         )
         receiver_thread.start()
-
-        def state_loop() -> None:
-            state_seq = 0
-
-            def read_state(_: int) -> None:
-                nonlocal state_seq
-                stamp_ns = time.perf_counter_ns()
-                state = robot.read_state()
-                _put_latest(
-                    sample_queue,
-                    TimedSample("robot_state", state_seq, stamp_ns, stamp_ns, state),
-                )
-                state_seq += 1
-                metrics["state_ticks"] += 1
-
-            try:
-                _periodic(stop_event, float(cfg["rates"]["state_hz"]), read_state)
-            except BaseException as exc:
-                _status_put(
-                    status_queue,
-                    "control",
-                    "error",
-                    component="robot_state",
-                    error=repr(exc),
-                    traceback=traceback.format_exc(),
-                )
-                stop_event.set()
-
-        state_thread = threading.Thread(target=state_loop, name="robot-state", daemon=True)
-        state_thread.start()
-        _status_put(status_queue, "control", "ready", udp_port=cfg["network"]["data_port"])
+        _status_put(
+            status_queue,
+            "control",
+            "ready",
+            udp_port=cfg["network"]["data_port"],
+            active=False,
+        )
 
         last_report_ns = time.perf_counter_ns()
         period_ns = int(1e9 / float(cfg["rates"]["control_hz"]))
         deadline_ns = time.perf_counter_ns()
         while not stop_event.is_set():
+            if not active:
+                try:
+                    handle_command(control_queue.get(timeout=0.2))
+                except queue.Empty:
+                    pass
+                deadline_ns = time.perf_counter_ns()
+                continue
+
+            while True:
+                try:
+                    handle_command(control_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if not active:
+                continue
+
             tick_start_ns = time.perf_counter_ns()
             selected = teleop_buffer.latest()
             if selected is None:
@@ -229,12 +358,22 @@ def _control_process(
                         metrics["stale_teleop"] += 1
                 except (KeyError, TypeError, ValueError):
                     metrics["stale_teleop"] += 1
-                    LOG.warning("丢弃非法双侧遥操作包 seq=%s", selected.seq, exc_info=True)
+                    LOG.warning(
+                        "丢弃非法双侧遥操作包 seq=%s",
+                        selected.seq,
+                        exc_info=True,
+                    )
 
             metrics["control_ticks"] += 1
             now_ns = time.perf_counter_ns()
             if now_ns - last_report_ns >= 1_000_000_000:
-                _status_put(status_queue, "control", "metrics", metrics=dict(metrics))
+                _status_put(
+                    status_queue,
+                    "control",
+                    "metrics",
+                    metrics=dict(metrics),
+                    active=True,
+                )
                 last_report_ns = now_ns
             deadline_ns += period_ns
             remaining_ns = deadline_ns - time.perf_counter_ns()
@@ -257,17 +396,7 @@ def _control_process(
             receiver.close()
         if receiver_thread is not None:
             receiver_thread.join(timeout=2)
-        if state_thread is not None:
-            state_thread.join(timeout=3)
-        if robot is not None:
-            try:
-                robot.stop()
-            except Exception:
-                LOG.exception("机器人停止失败")
-            try:
-                robot.disconnect()
-            except Exception:
-                LOG.exception("机器人断开失败")
+        deactivate("shutdown")
         _status_put(status_queue, "control", "stopped", metrics=dict(metrics))
 
 
@@ -302,13 +431,22 @@ def _make_cameras(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_frame(
-    buffers: dict[str, TimeBuffer], target_ns: int, max_lag_ns: int
+    buffers: dict[str, TimeBuffer],
+    target_ns: int,
+    max_lag_ns: int,
+    diagnostics: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     selected = {
         name: buffers[name].select_before(target_ns, max_lag_ns)
         for name in ALIGNMENT_NAMES
     }
-    if any(value.sample is None for value in selected.values()):
+    missing = [name for name, value in selected.items() if value.sample is None]
+    if missing:
+        if diagnostics is not None:
+            diagnostics["incomplete_frames"] = diagnostics.get("incomplete_frames", 0) + 1
+            for name in missing:
+                key = f"missing_{name}"
+                diagnostics[key] = diagnostics.get(key, 0) + 1
         return None
     state: BimanualRobotState = selected["robot_state"].sample.value
     action: BimanualControlCommand = selected["control_action"].sample.value
@@ -373,6 +511,7 @@ def _recorder_process(
     )
     writer_results: queue.Queue[dict[str, Any]] = queue.Queue()
     metrics = {
+        "frame_attempts": 0,
         "frame_ticks": 0,
         "written_frames": 0,
         "writer_drops": 0,
@@ -382,12 +521,16 @@ def _recorder_process(
     cameras: dict[str, Any] = {}
     connected_cameras: list[str] = []
     worker_threads: list[threading.Thread] = []
+    camera_threads: list[threading.Thread] = []
+    capture_stop: threading.Event | None = None
     writer = None
     writer_thread: threading.Thread | None = None
     episode_state = "idle"
     episode_session = 0
     episode_frames = 0
     episode_task = str(cfg["dataset"]["task"])
+    episode_start_ns = 0
+    episode_diagnostics: dict[str, int] = {}
 
     def fail(component: str, exc: BaseException) -> None:
         _status_put(
@@ -416,13 +559,97 @@ def _recorder_process(
         # episode 边界不能丢；它不在控制进程中，允许短暂等待写队列腾出空间。
         writer_queue.put((kind, payload), timeout=5)
 
+    def camera_loop(
+        name: str, camera: Any, session_stop: threading.Event
+    ) -> None:
+        seq = 0
+        last_stamp_ns = -1
+        try:
+            def read_camera(_: int) -> None:
+                nonlocal seq, last_stamp_ns
+                image, stamp_ns = camera.read()
+                stamp_ns = int(stamp_ns)
+                if stamp_ns <= last_stamp_ns:
+                    key = f"duplicate_{name}"
+                    episode_diagnostics[key] = episode_diagnostics.get(key, 0) + 1
+                    return
+                last_stamp_ns = stamp_ns
+                buffers[name].append(
+                    TimedSample(name, seq, stamp_ns, stamp_ns, image)
+                )
+                key = f"camera_{name}"
+                episode_diagnostics[key] = episode_diagnostics.get(key, 0) + 1
+                seq += 1
+
+            _periodic(
+                session_stop, float(cfg["rates"]["camera_hz"]), read_camera
+            )
+        except BaseException as exc:
+            if not session_stop.is_set() and not stop_event.is_set():
+                fail(name, exc)
+
+    def start_capture() -> None:
+        nonlocal cameras, connected_cameras, camera_threads, capture_stop
+        for buffer in buffers.values():
+            buffer.clear()
+        episode_diagnostics.clear()
+        cameras = _make_cameras(cfg)
+        connected_cameras = []
+        try:
+            for name in CAMERA_NAMES:
+                cameras[name].connect()
+                connected_cameras.append(name)
+            capture_stop = threading.Event()
+            camera_threads = [
+                threading.Thread(
+                    target=camera_loop,
+                    args=(name, cameras[name], capture_stop),
+                    name=f"camera-{name}",
+                    daemon=True,
+                )
+                for name in CAMERA_NAMES
+            ]
+            for thread in camera_threads:
+                thread.start()
+        except BaseException:
+            for name in reversed(connected_cameras):
+                try:
+                    cameras[name].disconnect()
+                except Exception:
+                    LOG.exception("%s 相机启动回滚失败", name)
+            cameras = {}
+            connected_cameras = []
+            camera_threads = []
+            capture_stop = None
+            raise
+
+    def stop_capture() -> None:
+        nonlocal cameras, connected_cameras, camera_threads, capture_stop
+        if capture_stop is not None:
+            capture_stop.set()
+        for thread in camera_threads:
+            thread.join(timeout=3)
+        for name in reversed(connected_cameras):
+            try:
+                cameras[name].disconnect()
+            except Exception:
+                LOG.exception("%s 相机断开失败", name)
+        cameras = {}
+        connected_cameras = []
+        camera_threads = []
+        capture_stop = None
+
     def start_episode(task: str | None = None) -> None:
-        nonlocal episode_state, episode_session, episode_frames, episode_task
+        nonlocal episode_state, episode_session, episode_frames
+        nonlocal episode_task, episode_start_ns
         if episode_state != "idle":
             publish_episode_status(
                 "episode_rejected", command="start", reason=f"state={episode_state}"
             )
             return
+        episode_state = "starting"
+        publish_episode_status("episode_starting")
+        start_capture()
         episode_session += 1
         episode_frames = 0
         episode_task = task.strip() if task and task.strip() else str(cfg["dataset"]["task"])
@@ -430,9 +657,13 @@ def _recorder_process(
             "begin",
             {"session": episode_session, "task": episode_task},
         )
+        episode_start_ns = time.perf_counter_ns()
         episode_state = "recording"
         publish_episode_status(
-            "episode_started", task=episode_task, video_mode=writer.video_mode
+            "episode_started",
+            task=episode_task,
+            video_mode=writer.video_mode,
+            cameras_connected=list(CAMERA_NAMES),
         )
 
     def finish_episode(save: bool, reason: str) -> None:
@@ -444,15 +675,24 @@ def _recorder_process(
                 reason=f"state={episode_state}",
             )
             return
+        episode_state = "stopping"
+        stop_capture()
         should_save = save and episode_frames >= min_frames
         command = "save" if should_save else "discard"
         episode_state = "saving" if should_save else "discarding"
+        duration_s = (
+            (time.perf_counter_ns() - episode_start_ns) / 1e9
+            if episode_start_ns
+            else 0.0
+        )
         enqueue_boundary(
             command,
             {
                 "session": episode_session,
                 "frames": episode_frames,
                 "reason": reason,
+                "duration_s": duration_s,
+                "diagnostics": dict(episode_diagnostics),
             },
         )
         publish_episode_status(
@@ -460,6 +700,8 @@ def _recorder_process(
             requested_save=save,
             action=command,
             reason=reason,
+            duration_s=duration_s,
+            diagnostics=dict(episode_diagnostics),
         )
 
     def drain_writer_results() -> None:
@@ -477,12 +719,19 @@ def _recorder_process(
                     "episode_saved",
                     episode_index=result["episode_index"],
                     saved_frames=result["frames"],
+                    writer_frames=result["writer_frames"],
+                    duration_s=result["duration_s"],
+                    diagnostics=result["diagnostics"],
+                    save_report=result["save_report"],
                 )
             elif kind == "discarded":
                 episode_state = "idle"
                 metrics["discarded_episodes"] += 1
                 publish_episode_status(
-                    "episode_discarded", discarded_frames=result["frames"]
+                    "episode_discarded",
+                    discarded_frames=result["frames"],
+                    duration_s=result["duration_s"],
+                    diagnostics=result["diagnostics"],
                 )
 
     def handle_episode_commands() -> None:
@@ -502,16 +751,12 @@ def _recorder_process(
                 publish_episode_status("episode_status", task=episode_task)
 
     try:
-        cameras = _make_cameras(cfg)
         schema = feature_schema(
             int(cfg["cameras"]["height"]),
             int(cfg["cameras"]["width"]),
             int(cfg["robot"]["hand_dof"]),
         )
         writer = make_writer(cfg["dataset"], schema, int(cfg["rates"]["frame_hz"]))
-        for name in CAMERA_NAMES:
-            cameras[name].connect()
-            connected_cameras.append(name)
 
         def ipc_loop() -> None:
             while not stop_event.is_set():
@@ -521,22 +766,6 @@ def _recorder_process(
                     continue
                 if isinstance(sample, TimedSample) and sample.source in buffers:
                     buffers[sample.source].append(sample)
-
-        def camera_loop(name: str) -> None:
-            seq = 0
-            try:
-                def read_camera(_: int) -> None:
-                    nonlocal seq
-                    image, stamp_ns = cameras[name].read()
-                    buffers[name].append(
-                        TimedSample(name, seq, stamp_ns, stamp_ns, image)
-                    )
-                    seq += 1
-
-                _periodic(stop_event, float(cfg["rates"]["camera_hz"]), read_camera)
-            except BaseException as exc:
-                if not stop_event.is_set():
-                    fail(name, exc)
 
         def writer_loop() -> None:
             try:
@@ -550,18 +779,35 @@ def _recorder_process(
                         writer.add_frame(payload)
                         metrics["written_frames"] += 1
                     elif kind == "save":
+                        pending_frames = writer.pending_frames()
+                        if pending_frames != int(payload["frames"]):
+                            raise RuntimeError(
+                                "Writer 帧数与组帧计数不一致："
+                                f"writer={pending_frames}, grouped={payload['frames']}"
+                            )
                         episode_index = writer.save_episode()
                         writer_results.put(
                             {
                                 "kind": "saved",
                                 "episode_index": episode_index,
                                 "frames": payload["frames"],
+                                "duration_s": payload["duration_s"],
+                                "diagnostics": payload["diagnostics"],
+                                "writer_frames": pending_frames,
+                                "save_report": getattr(
+                                    writer, "last_save_report", {}
+                                ),
                             }
                         )
                     elif kind == "discard":
                         writer.discard_episode()
                         writer_results.put(
-                            {"kind": "discarded", "frames": payload["frames"]}
+                            {
+                                "kind": "discarded",
+                                "frames": payload["frames"],
+                                "duration_s": payload["duration_s"],
+                                "diagnostics": payload["diagnostics"],
+                            }
                         )
             except BaseException as exc:
                 fail("dataset_writer", exc)
@@ -574,12 +820,6 @@ def _recorder_process(
         worker_threads.append(
             threading.Thread(target=ipc_loop, name="ipc-reader", daemon=True)
         )
-        worker_threads.extend(
-            threading.Thread(
-                target=camera_loop, args=(name,), name=f"camera-{name}", daemon=True
-            )
-            for name in CAMERA_NAMES
-        )
         writer_thread = threading.Thread(
             target=writer_loop, name="dataset-writer", daemon=False
         )
@@ -591,9 +831,10 @@ def _recorder_process(
             status_queue,
             "recorder",
             "ready",
-            cameras=list(CAMERA_NAMES),
+            cameras_connected=[],
             existing_episodes=writer.total_episodes,
             video_mode=writer.video_mode,
+            episode_state="idle",
         )
         if bool(episode_cfg.get("auto_start", False)):
             start_episode()
@@ -606,11 +847,21 @@ def _recorder_process(
             handle_episode_commands()
             drain_writer_results()
             if episode_state == "recording":
-                frame = _build_frame(buffers, time.perf_counter_ns(), max_lag_ns)
+                metrics["frame_attempts"] += 1
+                episode_diagnostics["frame_attempts"] = (
+                    episode_diagnostics.get("frame_attempts", 0) + 1
+                )
+                frame = _build_frame(
+                    buffers,
+                    time.perf_counter_ns(),
+                    max_lag_ns,
+                    episode_diagnostics,
+                )
                 if frame is not None:
                     try:
                         writer_queue.put_nowait(("frame", frame))
                         episode_frames += 1
+                        episode_diagnostics["grouped_frames"] = episode_frames
                     except queue.Full:
                         # 只丢当前新帧，绝不从队列中误删 begin/save 边界。
                         metrics["writer_drops"] += 1
@@ -675,11 +926,7 @@ def _recorder_process(
             except BaseException as exc:
                 fail("dataset_finalize", exc)
 
-        for name in reversed(connected_cameras):
-            try:
-                cameras[name].disconnect()
-            except Exception:
-                LOG.exception("%s 相机断开失败", name)
+        stop_capture()
         _status_put(
             status_queue,
             "recorder",
@@ -701,6 +948,7 @@ def run_robot_multiprocess(
     stop_event = ctx.Event()
     sample_queue = ctx.Queue(maxsize=int(runtime_cfg.get("ipc_queue_capacity", 2048)))
     episode_queue = ctx.Queue(maxsize=int(episode_cfg.get("command_queue_capacity", 32)))
+    control_queue = ctx.Queue(maxsize=int(episode_cfg.get("command_queue_capacity", 32)))
     status_queue = ctx.Queue(maxsize=int(runtime_cfg.get("status_queue_capacity", 128)))
     processes = {
         "recorder": ctx.Process(
@@ -711,19 +959,32 @@ def run_robot_multiprocess(
         "control": ctx.Process(
             name="device-b-control",
             target=_control_process,
-            args=(cfg, stop_event, sample_queue, status_queue),
+            args=(cfg, stop_event, sample_queue, control_queue, status_queue),
         ),
     }
     errors: list[dict[str, Any]] = []
+    desired_active = bool(episode_cfg.get("auto_start", False))
 
     def request_stop(*_: Any) -> None:
         stop_event.set()
 
     def submit_episode_command(kind: str, task: str | None = None) -> None:
+        nonlocal desired_active
+        if kind == "start":
+            desired_active = True
+        elif kind in {"stop", "discard"}:
+            desired_active = False
         try:
             episode_queue.put_nowait({"kind": kind, "task": task})
         except queue.Full:
             LOG.error("episode 命令队列已满，命令被拒绝：%s", kind)
+            return
+        # start 要等相机全部就绪后再发给控制进程；停止命令则立即广播。
+        if kind in {"stop", "discard", "status"}:
+            try:
+                control_queue.put_nowait({"kind": kind})
+            except queue.Full:
+                LOG.error("control 命令队列已满，命令被拒绝：%s", kind)
 
     def console_loop() -> None:
         LOG.info(
@@ -778,6 +1039,19 @@ def run_robot_multiprocess(
                     LOG.info("%s", json.dumps(status, ensure_ascii=False))
                 elif str(kind).startswith("episode_"):
                     LOG.info("EPISODE %s", json.dumps(status, ensure_ascii=False))
+                    if kind == "episode_started":
+                        if desired_active:
+                            control_queue.put({"kind": "start"}, timeout=2)
+                        else:
+                            # 相机连接期间用户已经 stop，不能再启动机器人。
+                            episode_queue.put({"kind": "stop"}, timeout=2)
+                    elif (
+                        kind == "episode_rejected"
+                        and status.get("command") == "start"
+                    ):
+                        desired_active = False
+                elif str(kind).startswith("control_"):
+                    LOG.info("CONTROL %s", json.dumps(status, ensure_ascii=False))
             except queue.Empty:
                 pass
 
@@ -834,7 +1108,7 @@ def run_robot_multiprocess(
                     status.get("component", "runtime"),
                     status.get("error"),
                 )
-        for ipc_queue in (sample_queue, episode_queue, status_queue):
+        for ipc_queue in (sample_queue, episode_queue, control_queue, status_queue):
             ipc_queue.close()
             ipc_queue.cancel_join_thread()
         signal.signal(signal.SIGINT, old_sigint)
