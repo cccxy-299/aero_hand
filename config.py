@@ -88,14 +88,48 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for name, default in (
         ("camera_start_timeout_s", 15),
         ("camera_shutdown_timeout_s", 5),
+        ("camera_failure_timeout_ms", 1500),
     ):
         if float(episode.get(name, default)) <= 0:
             raise ValueError(f"episode.{name} must be positive")
+    if float(episode.get("camera_retry_delay_ms", 10)) < 0:
+        raise ValueError("episode.camera_retry_delay_ms must be non-negative")
+    if int(episode.get("camera_error_report_interval", 30)) <= 0:
+        raise ValueError("episode.camera_error_report_interval must be positive")
+    for camera in ("scene", "wrist_left", "wrist_right"):
+        camera_cfg = cfg["cameras"][camera]
+        for name in ("timeout_ms", "failure_timeout_ms"):
+            if name in camera_cfg and float(camera_cfg[name]) <= 0:
+                raise ValueError(f"cameras.{camera}.{name} must be positive")
+        if "retry_delay_ms" in camera_cfg and float(camera_cfg["retry_delay_ms"]) < 0:
+            raise ValueError(
+                f"cameras.{camera}.retry_delay_ms must be non-negative"
+            )
+        if (
+            "error_report_interval" in camera_cfg
+            and int(camera_cfg["error_report_interval"]) <= 0
+        ):
+            raise ValueError(
+                f"cameras.{camera}.error_report_interval must be positive"
+            )
     if float(episode.get("min_camera_fps", 1)) <= 0:
         raise ValueError("episode.min_camera_fps must be positive")
     unique_ratio = float(episode.get("min_camera_unique_ratio", 0.7))
     if not 0 < unique_ratio <= 1:
         raise ValueError("episode.min_camera_unique_ratio must be in (0, 1]")
+    error_ratio = float(episode.get("max_camera_error_ratio", 0.10))
+    if not 0 <= error_ratio < 1:
+        raise ValueError("episode.max_camera_error_ratio must be in [0, 1)")
+    dataset = cfg["dataset"]
+    for name in ("queue_capacity", "encoder_queue_maxsize"):
+        if name in dataset and int(dataset[name]) <= 0:
+            raise ValueError(f"dataset.{name} must be positive")
+    for name in ("image_writer_processes", "image_writer_threads"):
+        if name in dataset and int(dataset[name]) < 0:
+            raise ValueError(f"dataset.{name} must be non-negative")
+    if dataset.get("encoder_threads") is not None:
+        if int(dataset["encoder_threads"]) <= 0:
+            raise ValueError("dataset.encoder_threads must be positive")
     dataset_root = Path(cfg["dataset"]["root"])
     if not dataset_root.is_absolute():
         # 固定相对于代码目录解析，避免两次启动时因 cwd 不同写到两个数据集。

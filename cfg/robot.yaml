@@ -29,9 +29,14 @@ episode:
   # start 等待三路独立相机进程就绪；stop 超时后会强制回收卡死的 SDK 进程。
   camera_start_timeout_s: 15
   camera_shutdown_timeout_s: 5
+  # 瞬时空包/损坏帧只丢当前帧；持续无有效画面超过该时间才停止整个 episode。
+  camera_failure_timeout_ms: 1500
+  camera_retry_delay_ms: 10
+  camera_error_report_interval: 30
   # 任一路相机低于这些质量门限时自动丢弃 episode，避免把卡顿视频用于训练。
   min_camera_fps: 24
   min_camera_unique_ratio: 0.70
+  max_camera_error_ratio: 0.10
   reject_low_quality_episode: true
 robot:
   enabled: true
@@ -74,6 +79,8 @@ cameras:
     format_idx: null
     strict_fps: true
     fps_tolerance: 1.0
+    # 缩短 SDK 单次阻塞时间，确保 stop 和持续故障检测可以及时响应。
+    timeout_ms: 500
     # 相机已经隔离到独立进程，进程内部不要再套一层 Python 采集线程。
     background_capture: false
   wrist_right:
@@ -81,6 +88,7 @@ cameras:
     format_idx: null
     strict_fps: true
     fps_tolerance: 1.0
+    timeout_ms: 500
     background_capture: false
   scene:
     driver: "realsense"
@@ -99,5 +107,7 @@ dataset:
   # 新版 LeRobot 直接流式编码 MP4；0.4 版本会自动回退为临时 PNG -> stop 时编码 MP4。
   streaming_encoding: true
   encoder_queue_maxsize: 90
+  # 三路视频各自编码；限制每路线程数，避免3个SVT-AV1编码器过度抢占控制进程CPU。
+  encoder_threads: 2
   image_writer_processes: 2
   image_writer_threads: 2

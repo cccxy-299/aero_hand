@@ -91,6 +91,8 @@ quit
 视觉 feature 的 dtype 已设置为 `video`，最终数据位于 LeRobot v3 的 `videos/`
 目录并使用 MP4。支持 `streaming_encoding` 的新版 LeRobot 会在采集时直接编码；
 LeRobot 0.4 会先暂存 PNG，在 `stop` 时编码为 MP4，最终训练数据仍是视频格式。
+三路 SVT-AV1 编码器默认各限制为2个线程，避免编码器按CPU核心数自动扩张后与
+100 Hz控制进程争抢调度；编码仍在记录路径中，不会反向阻塞控制下发。
 
 再次启动时，程序以 `meta/info.json` 判断是否为有效数据集。新版调用 `resume()`；
 LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前配置不一致时会拒绝
@@ -107,8 +109,11 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
 - `source_fps_*`：相机真正产生唯一画面的速率，不是配置中的轮询频率。
 - `unique_ratio_*`：写入 frame 中实际使用的新相机画面比例；其余为维持真实时间轴而
   重复使用的上一帧。
+- `camera_frame_errors_*` 与 `camera_error_ratio_*`：SDK失败、空MJPEG包及损坏帧
+  的累计数量和占总取帧结果的比例；`camera_<reason>_*` 会进一步区分错误原因。
 
-默认质量门限为每路相机至少 24 FPS、唯一画面比例至少 0.70。任一路不达标时输出
+默认质量门限为每路相机至少 24 FPS、唯一画面比例至少 0.70、坏帧比例不超过
+0.10。任一路不达标时输出
 `episode_quality_failed` 并丢弃该 episode，避免把“30 FPS 容器中只有几张画面”的
 卡顿视频混入训练集。
 
@@ -168,6 +173,11 @@ TCP 和左右工作空间标定。
 分辨率且最接近 `camera_hz` 的格式。`strict_fps: true` 会在设备只能提供低帧率模式时
 拒绝开始 episode，而不是以 30 Hz 反复读取同一张画面。若必须手动指定
 `format_idx`，应先查看启动日志中的完整格式列表，并确认选中模式为 30 FPS。
+
+VizionSDK 的单次失败返回码、空 MJPEG buffer 或损坏 JPEG 只会丢弃当前帧，上一张
+有效共享内存画面保持可用；恢复后继续当前 episode。只有连续
+`camera_failure_timeout_ms`（默认 1500 ms）没有任何有效图像才会停止系统。这样既
+不会因一个 USB 瞬时坏包误停机，也不会在相机真正离线后继续控制和保存坏数据。
 
 ## Intel RealSense 全景相机
 

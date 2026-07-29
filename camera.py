@@ -32,18 +32,56 @@ camera_num_to_index: Dict[int, int] = {}
 # ============================================================
 # 2. UYVY 解码函数
 # ============================================================
-def decode_mjpg(image) -> Optional[np.ndarray]:
+class CameraFrameError(RuntimeError):
+    """单帧采集失败；上层可重试，不能直接等同于相机永久离线。"""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _buffer_size(image) -> int:
+    """返回 SDK 图像 buffer 的字节/元素数；无法转换时返回 -1。"""
     if image is None:
+        return 0
+    try:
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            return len(image)
+        return int(np.asarray(image).size)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _sdk_call_succeeded(result) -> bool:
+    """VizionSDK 的成功返回码为 0；兼容部分绑定成功时返回 None。"""
+    if result is None:
+        return True
+    try:
+        return int(result) == 0
+    except (TypeError, ValueError):
+        return result == 0
+
+
+def decode_mjpg(image) -> Optional[np.ndarray]:
+    if image is None or _buffer_size(image) < 4:
         return None
 
-    if isinstance(image, (bytes, bytearray, memoryview)):
-        buf = np.frombuffer(image, dtype=np.uint8)
-    else:
-        buf = np.asarray(image, dtype=np.uint8).reshape(-1)
+    try:
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            buf = np.frombuffer(image, dtype=np.uint8)
+        else:
+            buf = np.asarray(image, dtype=np.uint8).reshape(-1)
+    except (TypeError, ValueError):
+        return None
 
     # MJPG 是自描述的 JPEG 压缩数据，cv2.imdecode 直接解码为 BGR
-    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    return frame  # 解码失败时返回 None
+    try:
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except cv2.error:
+        return None
+    if frame is None or frame.size == 0 or frame.ndim != 3:
+        return None
+    return frame
 
 def decode_uyvy(image, width: int, height: int) -> Optional[np.ndarray]:
     """
@@ -80,7 +118,11 @@ def detect_connected_cameras() -> List[int]:
     """
     logger = logging.getLogger("detect_cameras")
 
-    _, connected_serials = pyvizionsdk.VxDiscoverCameraDevices()
+    result, connected_serials = pyvizionsdk.VxDiscoverCameraDevices()
+    if not _sdk_call_succeeded(result):
+        raise RuntimeError(
+            f"VxDiscoverCameraDevices 失败: result={result!r}"
+        )
     logger.info(f"Connected serials: {connected_serials}")
 
     connected_cam_nums: List[int] = []
@@ -214,7 +256,11 @@ class CameraInterface:
             self._thread.start()
             self.logger.info(f"{self.name} capture thread started.")
             # 后台模式等待第一帧，避免 connect() 返回后立即读到空值。
-            self._wait_first_frame()
+            try:
+                self._wait_first_frame()
+            except BaseException:
+                self.disconnect()
+                raise
         else:
             self.logger.info(
                 "%s uses direct blocking capture in the camera process.", self.name
@@ -231,11 +277,26 @@ class CameraInterface:
 
         if self.camera is not None:
             try:
-                pyvizionsdk.VxStopStreaming(self.camera)
-                pyvizionsdk.VxClose(self.camera)
+                result = pyvizionsdk.VxStopStreaming(self.camera)
+                if not _sdk_call_succeeded(result):
+                    self.logger.warning(
+                        "VxStopStreaming 返回失败状态: %r", result
+                    )
             except Exception as e:
-                self.logger.warning(f"释放摄像头资源时出现异常: {e}")
+                self.logger.warning(f"停止摄像头数据流时出现异常: {e}")
+            try:
+                result = pyvizionsdk.VxClose(self.camera)
+                if not _sdk_call_succeeded(result):
+                    self.logger.warning("VxClose 返回失败状态: %r", result)
+            except Exception as e:
+                self.logger.warning(f"关闭摄像头时出现异常: {e}")
 
+        self.camera = None
+        self.format = None
+        self._thread = None
+        with self._lock:
+            self._frame_bgr = None
+            self._frame_timestamp = None
         self.logger.info(f"{self.name} stopped and camera released.")
 
     def _init_tn_camera(self, index: int):
@@ -243,63 +304,101 @@ class CameraInterface:
         初始化 TechNexion 摄像头，并选择 MJPG 格式。
         """
         camera = pyvizionsdk.VxInitialCameraDevice(index)
-        pyvizionsdk.VxOpen(camera)
-
-        _, format_list = pyvizionsdk.VxGetFormatList(camera)
-
-        mjpg_formats = [
-            f for f in format_list
-            if f.format == VX_IMAGE_FORMAT.VX_IMAGE_FORMAT_MJPG
-        ]
-
-        self.logger.info(f"Available MJPG formats ({len(mjpg_formats)} total):")
-        for i, fmt in enumerate(mjpg_formats):
-            self.logger.info(f"  [{i}] {fmt.width}x{fmt.height} @{fmt.framerate}fps")
-
-        if len(mjpg_formats) == 0:
-            raise RuntimeError(f"No MJPG formats found for camera index {index}")
-
-        if self.format_idx is None:
-            # 不再依赖设备枚举顺序。优先匹配目标分辨率，再选择最接近期望 FPS 的模式。
-            target_width = self.target_width or mjpg_formats[0].width
-            target_height = self.target_height or mjpg_formats[0].height
-            exact_resolution = [
-                fmt
-                for fmt in mjpg_formats
-                if fmt.width == target_width and fmt.height == target_height
-            ]
-            candidates = exact_resolution or mjpg_formats
-            fmt = min(
-                candidates,
-                key=lambda value: (
-                    abs(float(value.framerate) - float(self.fps)),
-                    abs(int(value.width) - int(target_width))
-                    + abs(int(value.height) - int(target_height)),
-                ),
-            )
-            selected_idx = mjpg_formats.index(fmt)
-        else:
-            selected_idx = min(int(self.format_idx), len(mjpg_formats) - 1)
-            fmt = mjpg_formats[selected_idx]
-
-        effective_fps = float(fmt.framerate)
-        if self.strict_fps and abs(effective_fps - float(self.fps)) > self.fps_tolerance:
+        if camera is None:
             raise RuntimeError(
-                f"{self.name} 找不到满足 FPS 的 MJPG 模式："
-                f"requested={self.fps}, selected={effective_fps}, "
-                f"resolution={fmt.width}x{fmt.height}, format_idx={selected_idx}"
+                f"VxInitialCameraDevice({index}) 返回空设备句柄"
+            )
+        opened = False
+        streaming = False
+        try:
+            result = pyvizionsdk.VxOpen(camera)
+            if not _sdk_call_succeeded(result):
+                raise RuntimeError(f"VxOpen 失败: result={result!r}")
+            opened = True
+
+            result, format_list = pyvizionsdk.VxGetFormatList(camera)
+            if not _sdk_call_succeeded(result):
+                raise RuntimeError(f"VxGetFormatList 失败: result={result!r}")
+
+            mjpg_formats = [
+                f for f in format_list
+                if f.format == VX_IMAGE_FORMAT.VX_IMAGE_FORMAT_MJPG
+            ]
+
+            self.logger.info(f"Available MJPG formats ({len(mjpg_formats)} total):")
+            for i, fmt in enumerate(mjpg_formats):
+                self.logger.info(
+                    f"  [{i}] {fmt.width}x{fmt.height} @{fmt.framerate}fps"
+                )
+
+            if len(mjpg_formats) == 0:
+                raise RuntimeError(f"No MJPG formats found for camera index {index}")
+
+            if self.format_idx is None:
+                # 不再依赖设备枚举顺序。优先匹配目标分辨率，再选择最接近期望 FPS 的模式。
+                target_width = self.target_width or mjpg_formats[0].width
+                target_height = self.target_height or mjpg_formats[0].height
+                exact_resolution = [
+                    fmt
+                    for fmt in mjpg_formats
+                    if fmt.width == target_width and fmt.height == target_height
+                ]
+                candidates = exact_resolution or mjpg_formats
+                fmt = min(
+                    candidates,
+                    key=lambda value: (
+                        abs(float(value.framerate) - float(self.fps)),
+                        abs(int(value.width) - int(target_width))
+                        + abs(int(value.height) - int(target_height)),
+                    ),
+                )
+                selected_idx = mjpg_formats.index(fmt)
+            else:
+                selected_idx = int(self.format_idx)
+                if not 0 <= selected_idx < len(mjpg_formats):
+                    raise ValueError(
+                        f"{self.name} format_idx={selected_idx} 越界，"
+                        f"可用范围为 0..{len(mjpg_formats) - 1}"
+                    )
+                fmt = mjpg_formats[selected_idx]
+
+            effective_fps = float(fmt.framerate)
+            if (
+                self.strict_fps
+                and abs(effective_fps - float(self.fps)) > self.fps_tolerance
+            ):
+                raise RuntimeError(
+                    f"{self.name} 找不到满足 FPS 的 MJPG 模式："
+                    f"requested={self.fps}, selected={effective_fps}, "
+                    f"resolution={fmt.width}x{fmt.height}, format_idx={selected_idx}"
+                )
+
+            self.logger.info(
+                f"Selected MJPG format [{selected_idx}]: "
+                f"{fmt.width}x{fmt.height} @{fmt.framerate}fps"
             )
 
-        self.logger.info(
-            f"Selected MJPG format [{selected_idx}]: "
-            f"{fmt.width}x{fmt.height} @{fmt.framerate}fps"
-        )
-
-        pyvizionsdk.VxSetFormat(camera, fmt)
-        # self._apply_isp_defaults(camera)
-        pyvizionsdk.VxStartStreaming(camera)
-
-        return camera, fmt
+            result = pyvizionsdk.VxSetFormat(camera, fmt)
+            if not _sdk_call_succeeded(result):
+                raise RuntimeError(f"VxSetFormat 失败: result={result!r}")
+            # self._apply_isp_defaults(camera)
+            result = pyvizionsdk.VxStartStreaming(camera)
+            if not _sdk_call_succeeded(result):
+                raise RuntimeError(f"VxStartStreaming 失败: result={result!r}")
+            streaming = True
+            return camera, fmt
+        except BaseException:
+            if streaming:
+                try:
+                    pyvizionsdk.VxStopStreaming(camera)
+                except Exception:
+                    self.logger.exception("相机启动回滚时停止数据流失败")
+            if opened:
+                try:
+                    pyvizionsdk.VxClose(camera)
+                except Exception:
+                    self.logger.exception("相机启动回滚时关闭设备失败")
+            raise
 
     def _apply_isp_defaults(self, camera: pyvizionsdk.VxCamera):
         """
@@ -368,18 +467,32 @@ class CameraInterface:
                     self.logger.warning(f"Camera capture exception: {e}")
                 time.sleep(0.01)
 
-    def _read_bgr_blocking(self) -> Optional[np.ndarray]:
+    def _read_bgr_blocking(self) -> np.ndarray:
         """从厂商 SDK 阻塞读取并解码一帧，仅由一个线程调用。"""
         if self.camera is None or self.format is None:
             raise RuntimeError(f"{self.name} 尚未连接")
-        _, image = pyvizionsdk.VxGetImage(
+        result, image = pyvizionsdk.VxGetImage(
             self.camera,
             self.timeout_ms,
             self.format,
         )
+        if not _sdk_call_succeeded(result):
+            raise CameraFrameError(
+                f"{self.name} VxGetImage 返回失败状态: {result!r}",
+                reason="sdk_error",
+            )
+        image_size = _buffer_size(image)
+        if image_size <= 0:
+            raise CameraFrameError(
+                f"{self.name} VxGetImage 返回空 MJPG buffer",
+                reason="empty_frame",
+            )
         frame_bgr = decode_mjpg(image)
         if frame_bgr is None:
-            return None
+            raise CameraFrameError(
+                f"{self.name} MJPG 解码失败，buffer_size={image_size}",
+                reason="decode_error",
+            )
         if self.target_width is not None and self.target_height is not None:
             frame_bgr = cv2.resize(
                 frame_bgr,
@@ -444,10 +557,11 @@ class CameraInterface:
         """
         if not self.background_capture:
             frame_bgr = self._read_bgr_blocking()
-            if frame_bgr is None:
-                raise RuntimeError(f"{self.name} MJPG 解码失败")
             # 时间戳取帧抵达设备 B 相机进程的单调时钟。
             timestamp = time.perf_counter()
+            with self._lock:
+                self._frame_bgr = frame_bgr
+                self._frame_timestamp = timestamp
         else:
             with self._lock:
                 if self._frame_bgr is None:
