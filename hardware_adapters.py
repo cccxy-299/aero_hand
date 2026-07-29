@@ -208,10 +208,16 @@ class TechNexionCamera:
         self.camera = CameraInterface(
             cam_num=int(cfg["cam_num"]),
             fps=fps,
-            format_idx=int(cfg.get("format_idx", 0)),
+            format_idx=(
+                int(cfg["format_idx"])
+                if cfg.get("format_idx") is not None
+                else None
+            ),
             name=name,
             target_width=width,
             target_height=height,
+            strict_fps=bool(cfg.get("strict_fps", True)),
+            fps_tolerance=float(cfg.get("fps_tolerance", 1.0)),
         )
 
     def connect(self) -> None:

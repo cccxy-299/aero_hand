@@ -85,6 +85,11 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for name, default in (("min_frames", 10), ("command_queue_capacity", 32)):
         if int(episode.get(name, default)) <= 0:
             raise ValueError(f"episode.{name} must be positive")
+    if float(episode.get("min_camera_fps", 1)) <= 0:
+        raise ValueError("episode.min_camera_fps must be positive")
+    unique_ratio = float(episode.get("min_camera_unique_ratio", 0.7))
+    if not 0 < unique_ratio <= 1:
+        raise ValueError("episode.min_camera_unique_ratio must be in (0, 1]")
     dataset_root = Path(cfg["dataset"]["root"])
     if not dataset_root.is_absolute():
         # 固定相对于代码目录解析，避免两次启动时因 cwd 不同写到两个数据集。

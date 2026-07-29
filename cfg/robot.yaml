@@ -26,6 +26,10 @@ episode:
   min_frames: 10
   save_on_shutdown: true
   command_queue_capacity: 32
+  # 任一路相机低于这些质量门限时自动丢弃 episode，避免把卡顿视频用于训练。
+  min_camera_fps: 24
+  min_camera_unique_ratio: 0.70
+  reject_low_quality_episode: true
 robot:
   enabled: true
   hand_dof: 7
@@ -63,10 +67,15 @@ cameras:
   height: 480
   wrist_left:
     cam_num: 0
-    format_idx: 1
+    # null 表示按目标分辨率和 camera_hz 自动选择底层 MJPG 模式。
+    format_idx: null
+    strict_fps: true
+    fps_tolerance: 1.0
   wrist_right:
     cam_num: 1
-    format_idx: 1
+    format_idx: null
+    strict_fps: true
+    fps_tolerance: 1.0
   scene:
     driver: "realsense"
     # 只有连接多台RealSense时才需要填写序列号；单台时可以留空。

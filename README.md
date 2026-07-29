@@ -104,6 +104,13 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
 - `grouped_frames`、`writer_frames`、`dataset_frame_delta`：组帧、Writer 缓冲及
   LeRobot 元数据实际增加的帧数；三者不一致时程序直接报错并停止。
 - `writer_drops`：Writer 队列拥塞导致的丢帧数。
+- `source_fps_*`：相机真正产生唯一画面的速率，不是配置中的轮询频率。
+- `unique_ratio_*`：写入 frame 中实际使用的新相机画面比例；其余为维持真实时间轴而
+  重复使用的上一帧。
+
+默认质量门限为每路相机至少 24 FPS、唯一画面比例至少 0.70。任一路不达标时输出
+`episode_quality_failed` 并丢弃该 episode，避免把“30 FPS 容器中只有几张画面”的
+卡顿视频混入训练集。
 
 ## 多进程与数据流
 
@@ -148,6 +155,13 @@ TCP 和左右工作空间标定。
 - `observation.images.wrist_left`：左腕相机。
 - `observation.images.wrist_right`：右腕相机。
 - `diagnostics.safety_flags`：两维，依次为左、右安全标志。
+
+## TechNexion 腕部相机
+
+腕部相机默认使用 `format_idx: null`，连接时从设备报告的 MJPG 模式中自动选择目标
+分辨率且最接近 `camera_hz` 的格式。`strict_fps: true` 会在设备只能提供低帧率模式时
+拒绝开始 episode，而不是以 30 Hz 反复读取同一张画面。若必须手动指定
+`format_idx`，应先查看启动日志中的完整格式列表，并确认选中模式为 30 FPS。
 
 ## Intel RealSense 全景相机
 

@@ -134,12 +134,14 @@ class CameraInterface:
         self,
         cam_num: int,
         fps: int = 60,
-        format_idx: int = 7,
+        format_idx: Optional[int] = None,
         name: Optional[str] = None,
         target_width: Optional[int] = None,
         target_height: Optional[int] = None,
         timeout_ms: int = 2500,
         warmup_timeout_s: float = 5.0,
+        strict_fps: bool = True,
+        fps_tolerance: float = 1.0,
     ):
         self.cam_num = cam_num
         self.fps = fps
@@ -152,6 +154,8 @@ class CameraInterface:
 
         self.timeout_ms = timeout_ms
         self.warmup_timeout_s = warmup_timeout_s
+        self.strict_fps = strict_fps
+        self.fps_tolerance = float(fps_tolerance)
 
         self.logger = logging.getLogger(self.name)
 
@@ -248,10 +252,39 @@ class CameraInterface:
         if len(mjpg_formats) == 0:
             raise RuntimeError(f"No MJPG formats found for camera index {index}")
 
-        fmt = mjpg_formats[min(self.format_idx, len(mjpg_formats) - 1)]
+        if self.format_idx is None:
+            # 不再依赖设备枚举顺序。优先匹配目标分辨率，再选择最接近期望 FPS 的模式。
+            target_width = self.target_width or mjpg_formats[0].width
+            target_height = self.target_height or mjpg_formats[0].height
+            exact_resolution = [
+                fmt
+                for fmt in mjpg_formats
+                if fmt.width == target_width and fmt.height == target_height
+            ]
+            candidates = exact_resolution or mjpg_formats
+            fmt = min(
+                candidates,
+                key=lambda value: (
+                    abs(float(value.framerate) - float(self.fps)),
+                    abs(int(value.width) - int(target_width))
+                    + abs(int(value.height) - int(target_height)),
+                ),
+            )
+            selected_idx = mjpg_formats.index(fmt)
+        else:
+            selected_idx = min(int(self.format_idx), len(mjpg_formats) - 1)
+            fmt = mjpg_formats[selected_idx]
+
+        effective_fps = float(fmt.framerate)
+        if self.strict_fps and abs(effective_fps - float(self.fps)) > self.fps_tolerance:
+            raise RuntimeError(
+                f"{self.name} 找不到满足 FPS 的 MJPG 模式："
+                f"requested={self.fps}, selected={effective_fps}, "
+                f"resolution={fmt.width}x{fmt.height}, format_idx={selected_idx}"
+            )
 
         self.logger.info(
-            f"Selected MJPG format [{self.format_idx}]: "
+            f"Selected MJPG format [{selected_idx}]: "
             f"{fmt.width}x{fmt.height} @{fmt.framerate}fps"
         )
 

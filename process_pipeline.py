@@ -434,7 +434,7 @@ def _build_frame(
     buffers: dict[str, TimeBuffer],
     target_ns: int,
     max_lag_ns: int,
-    diagnostics: dict[str, int] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     selected = {
         name: buffers[name].select_before(target_ns, max_lag_ns)
@@ -480,6 +480,10 @@ def _build_frame(
         "diagnostics.safety_flags": np.asarray(
             [action.left.safety_flags, action.right.safety_flags], np.int64
         ),
+        # 仅供本进程统计重复画面，入 Writer 队列前会删除。
+        "__camera_source_seq": {
+            name: selected[name].sample.seq for name in CAMERA_NAMES
+        },
     }
 
 
@@ -501,6 +505,13 @@ def _recorder_process(
     episode_cfg = cfg.get("episode", {})
     min_frames = int(episode_cfg.get("min_frames", 10))
     save_on_shutdown = bool(episode_cfg.get("save_on_shutdown", True))
+    min_camera_fps = float(
+        episode_cfg.get("min_camera_fps", float(cfg["rates"]["frame_hz"]) * 0.8)
+    )
+    min_unique_ratio = float(episode_cfg.get("min_camera_unique_ratio", 0.7))
+    reject_low_quality = bool(
+        episode_cfg.get("reject_low_quality_episode", True)
+    )
     buffers = {
         name: TimeBuffer(int(cfg["alignment"]["buffer_capacity"]))
         for name in ALIGNMENT_NAMES
@@ -530,7 +541,10 @@ def _recorder_process(
     episode_frames = 0
     episode_task = str(cfg["dataset"]["task"])
     episode_start_ns = 0
-    episode_diagnostics: dict[str, int] = {}
+    episode_diagnostics: dict[str, Any] = {}
+    camera_first_ns: dict[str, int] = {}
+    camera_last_ns: dict[str, int] = {}
+    last_group_camera_seq: dict[str, int] = {}
 
     def fail(component: str, exc: BaseException) -> None:
         _status_put(
@@ -577,6 +591,8 @@ def _recorder_process(
                 buffers[name].append(
                     TimedSample(name, seq, stamp_ns, stamp_ns, image)
                 )
+                camera_first_ns.setdefault(name, stamp_ns)
+                camera_last_ns[name] = stamp_ns
                 key = f"camera_{name}"
                 episode_diagnostics[key] = episode_diagnostics.get(key, 0) + 1
                 seq += 1
@@ -593,6 +609,9 @@ def _recorder_process(
         for buffer in buffers.values():
             buffer.clear()
         episode_diagnostics.clear()
+        camera_first_ns.clear()
+        camera_last_ns.clear()
+        last_group_camera_seq.clear()
         cameras = _make_cameras(cfg)
         connected_cameras = []
         try:
@@ -629,6 +648,15 @@ def _recorder_process(
             capture_stop.set()
         for thread in camera_threads:
             thread.join(timeout=3)
+        for name in CAMERA_NAMES:
+            count = int(episode_diagnostics.get(f"camera_{name}", 0))
+            elapsed_ns = camera_last_ns.get(name, 0) - camera_first_ns.get(name, 0)
+            source_fps = (
+                (count - 1) * 1e9 / elapsed_ns
+                if count > 1 and elapsed_ns > 0
+                else 0.0
+            )
+            episode_diagnostics[f"source_fps_{name}"] = round(source_fps, 3)
         for name in reversed(connected_cameras):
             try:
                 cameras[name].disconnect()
@@ -677,7 +705,35 @@ def _recorder_process(
             return
         episode_state = "stopping"
         stop_capture()
-        should_save = save and episode_frames >= min_frames
+        quality_failures: list[str] = []
+        for name in CAMERA_NAMES:
+            unique = int(episode_diagnostics.get(f"unique_used_{name}", 0))
+            ratio = unique / episode_frames if episode_frames > 0 else 0.0
+            episode_diagnostics[f"unique_ratio_{name}"] = round(ratio, 4)
+            source_fps = float(
+                episode_diagnostics.get(f"source_fps_{name}", 0.0)
+            )
+            if source_fps < min_camera_fps:
+                quality_failures.append(
+                    f"{name}: source_fps={source_fps:.2f}<{min_camera_fps:.2f}"
+                )
+            if ratio < min_unique_ratio:
+                quality_failures.append(
+                    f"{name}: unique_ratio={ratio:.3f}<{min_unique_ratio:.3f}"
+                )
+        if quality_failures:
+            episode_diagnostics["quality_failures"] = quality_failures
+            if save and reject_low_quality:
+                publish_episode_status(
+                    "episode_quality_failed",
+                    failures=quality_failures,
+                    diagnostics=dict(episode_diagnostics),
+                )
+        should_save = (
+            save
+            and episode_frames >= min_frames
+            and not (reject_low_quality and quality_failures)
+        )
         command = "save" if should_save else "discard"
         episode_state = "saving" if should_save else "discarding"
         duration_s = (
@@ -702,6 +758,7 @@ def _recorder_process(
             reason=reason,
             duration_s=duration_s,
             diagnostics=dict(episode_diagnostics),
+            quality_failures=quality_failures,
         )
 
     def drain_writer_results() -> None:
@@ -858,10 +915,20 @@ def _recorder_process(
                     episode_diagnostics,
                 )
                 if frame is not None:
+                    camera_source_seq = frame.pop("__camera_source_seq")
                     try:
                         writer_queue.put_nowait(("frame", frame))
                         episode_frames += 1
                         episode_diagnostics["grouped_frames"] = episode_frames
+                        for name, source_seq in camera_source_seq.items():
+                            if last_group_camera_seq.get(name) == source_seq:
+                                key = f"reused_in_group_{name}"
+                            else:
+                                key = f"unique_used_{name}"
+                                last_group_camera_seq[name] = source_seq
+                            episode_diagnostics[key] = (
+                                episode_diagnostics.get(key, 0) + 1
+                            )
                     except queue.Full:
                         # 只丢当前新帧，绝不从队列中误删 begin/save 边界。
                         metrics["writer_drops"] += 1
