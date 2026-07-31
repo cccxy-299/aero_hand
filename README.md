@@ -100,7 +100,9 @@ episode，也不会在遥操作开始前重复 disable/enable。相机启动期�
 state、action 或 VIVE 参考。
 
 `control_hz` 是安全计算频率，不等于真实硬件命令频率。双臂 `move_p` 默认通过
-`robot.arm_command_hz: 30` 限频，等待期间只保留最新目标；双手默认通过
+`robot.arm_command_hz: 30` 限频，等待期间只保留最新目标；机械臂反馈通过
+`robot.arm_feedback_hz: 30` 限制真实 SDK 读取频率，并采用命令优先的缓存读取，
+避免100Hz状态线程与 `move_p` 争抢同侧 SDK；双手默认通过
 `robot.hand_command_hz: 60` 限频。控制线程不会等待硬件 SDK。运行日志中的
 `hardware.workers` 会输出 `effective_hz`、`dropped` 和 `coalesced`，用于判断
 命令是否过密或 SDK 调用是否变慢。

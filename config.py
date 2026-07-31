@@ -229,6 +229,7 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
             raise ValueError(f"robot.{name} must be positive")
     for name, default in (
         ("arm_command_hz", 30),
+        ("arm_feedback_hz", 30),
         ("hand_command_hz", 60),
     ):
         if float(cfg["robot"].get(name, default)) <= 0:

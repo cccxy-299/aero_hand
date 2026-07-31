@@ -44,6 +44,8 @@ robot:
   # 安全计算仍为100Hz；真实硬件线程只消费最新目标并独立限频，避免双臂
   # move_p 高频发送与 USB 腕部相机/USB-CAN 适配器争抢主机资源。
   arm_command_hz: 30
+  # 真实反馈最多30Hz访问 SDK；100Hz 状态组帧读取最近完整缓存，命令待处理时让命令优先。
+  arm_feedback_hz: 30
   hand_command_hz: 60
   # 必须先在终端显式执行 home 并成功，之后才允许 start episode。
   require_home_before_start: true

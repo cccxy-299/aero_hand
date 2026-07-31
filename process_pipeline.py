@@ -200,6 +200,9 @@ def _control_process(
         "stale_teleop": 0,
         "control_overruns": 0,
         "control_sessions": 0,
+        "control_commands": 0,
+        "unique_teleop_packets": 0,
+        "reused_teleop_packets": 0,
     }
     robot = None
     retargeter = None
@@ -209,6 +212,7 @@ def _control_process(
     receiver_thread: threading.Thread | None = None
     state_thread: threading.Thread | None = None
     state_stop: threading.Event | None = None
+    last_selected_teleop_seq: int | None = None
 
     def ingest(sample: TimedSample) -> None:
         # 空闲时只完成网络时钟同步，不积压无效遥操作样本。
@@ -218,6 +222,7 @@ def _control_process(
 
     def deactivate(reason: str) -> None:
         nonlocal robot, retargeter, safety, active, state_thread, state_stop
+        nonlocal last_selected_teleop_seq
         if not active:
             hardware_state = (
                 robot.status_snapshot().get("state")
@@ -260,6 +265,7 @@ def _control_process(
         state_thread = None
         state_stop = None
         teleop_buffer.clear()
+        last_selected_teleop_seq = None
         _status_put(
             status_queue,
             "control",
@@ -278,6 +284,7 @@ def _control_process(
 
     def activate() -> None:
         nonlocal robot, retargeter, safety, active, state_thread, state_stop
+        nonlocal last_selected_teleop_seq
         if active:
             _status_put(
                 status_queue,
@@ -311,6 +318,7 @@ def _control_process(
             retargeter = candidate_retargeter
             safety = candidate_safety
             teleop_buffer.clear()
+            last_selected_teleop_seq = None
             state_stop = threading.Event()
 
             def state_loop(
@@ -320,12 +328,41 @@ def _control_process(
 
                 def read_state(_: int) -> None:
                     nonlocal state_seq
-                    stamp_ns = time.perf_counter_ns()
                     state = session_robot.read_state()
+                    feedback_stamps = getattr(
+                        session_robot, "feedback_timestamps_ns", lambda: {}
+                    )()
+                    valid_stamps = [
+                        int(value)
+                        for value in feedback_stamps.values()
+                        if int(value) > 0
+                    ]
+                    # 双侧样本采用较旧一侧的时间，避免把其中一侧的缓存状态
+                    # 错标为更新时刻；各侧原始时间和偏差保留在 meta 中。
+                    stamp_ns = (
+                        min(valid_stamps)
+                        if valid_stamps
+                        else time.perf_counter_ns()
+                    )
+                    feedback_skew_ms = (
+                        (max(valid_stamps) - min(valid_stamps)) / 1e6
+                        if len(valid_stamps) >= 2
+                        else 0.0
+                    )
                     _put_latest(
                         sample_queue,
                         TimedSample(
-                            "robot_state", state_seq, stamp_ns, stamp_ns, state
+                            "robot_state",
+                            state_seq,
+                            stamp_ns,
+                            stamp_ns,
+                            state,
+                            meta={
+                                "side_feedback_mono_ns": feedback_stamps,
+                                "feedback_skew_ms": round(
+                                    feedback_skew_ms, 3
+                                ),
+                            },
                         ),
                     )
                     state_seq += 1
@@ -550,6 +587,11 @@ def _control_process(
                 metrics["stale_teleop"] += 1
             else:
                 try:
+                    if selected.seq == last_selected_teleop_seq:
+                        metrics["reused_teleop_packets"] += 1
+                    else:
+                        metrics["unique_teleop_packets"] += 1
+                        last_selected_teleop_seq = selected.seq
                     teleop_age_ns = tick_start_ns - selected.local_mono_ns
                     if teleop_age_ns > teleop_timeout_ns:
                         # 过期包不能用于建立 VIVE 零点，也不应继续刷新手部命令。
@@ -579,6 +621,7 @@ def _control_process(
                                 selected.seq,
                             )
                             robot.command(safe)
+                            metrics["control_commands"] += 1
                             action_stamp_ns = time.perf_counter_ns()
                             _put_latest(
                                 sample_queue,

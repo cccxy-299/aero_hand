@@ -41,6 +41,9 @@ class LatestCommandWorker:
         self.queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.last_error: str | None = None
+        # busy 从回调准备进入硬件 SDK 前一直保持为 True。状态采集线程据此
+        # 主动让出同侧 SDK，避免高频反馈读取饿死控制命令线程。
+        self.busy = False
         self.dropped = 0
         self.coalesced = 0
         self.submitted = 0
@@ -49,11 +52,14 @@ class LatestCommandWorker:
         self.last_duration_ms = 0.0
         self.max_duration_ms = 0.0
         self.first_completed_ns = 0
+        self.last_submit_ns = 0
+        self.last_started_ns = 0
         self.last_completed_ns = 0
         self.thread.start()
 
     def submit(self, value: np.ndarray) -> None:
         self.submitted += 1
+        self.last_submit_ns = time.perf_counter_ns()
         try:
             self.queue.put_nowait(value.copy())
         except queue.Full:
@@ -70,6 +76,9 @@ class LatestCommandWorker:
             value = self.queue.get()
             if value is None:
                 return
+            # 从取到首个目标开始就声明命令占用，包括后续限频/合并等待。
+            # 否则状态线程会在该等待窗口误判为空闲并插入 SDK 读取。
+            self.busy = True
 
             # 限频等待期间继续消费单槽队列，只保留最近目标。
             # 控制线程可以100Hz计算，真实硬件 SDK 不会被同频率轰炸。
@@ -86,12 +95,14 @@ class LatestCommandWorker:
                     except queue.Empty:
                         break
                     if newer is None:
+                        self.busy = False
                         return
                     value = newer
                     self.coalesced += 1
 
             started_ns = time.perf_counter_ns()
             last_started_ns = started_ns
+            self.last_started_ns = started_ns
             try:
                 self.callback(value)
                 self.last_error = None
@@ -108,8 +119,15 @@ class LatestCommandWorker:
                 duration_ms = (time.perf_counter_ns() - started_ns) / 1e6
                 self.last_duration_ms = duration_ms
                 self.max_duration_ms = max(self.max_duration_ms, duration_ms)
+                self.busy = False
+
+    @property
+    def has_pending_work(self) -> bool:
+        """是否已有命令正在执行或等待执行（仅用于同进程调度提示）。"""
+        return self.busy or not self.queue.empty()
 
     def status_snapshot(self) -> dict[str, Any]:
+        now_ns = time.perf_counter_ns()
         completed_span_ns = self.last_completed_ns - self.first_completed_ns
         effective_hz = (
             (self.completed - 1) * 1e9 / completed_span_ns
@@ -119,6 +137,8 @@ class LatestCommandWorker:
         return {
             "max_hz": self.max_hz,
             "effective_hz": round(effective_hz, 3),
+            "busy": self.busy,
+            "pending": self.has_pending_work,
             "submitted": self.submitted,
             "completed": self.completed,
             "failed": self.failed,
@@ -126,6 +146,21 @@ class LatestCommandWorker:
             "coalesced": self.coalesced,
             "last_duration_ms": round(self.last_duration_ms, 3),
             "max_duration_ms": round(self.max_duration_ms, 3),
+            "last_submit_age_ms": (
+                round((now_ns - self.last_submit_ns) / 1e6, 3)
+                if self.last_submit_ns > 0
+                else None
+            ),
+            "last_start_age_ms": (
+                round((now_ns - self.last_started_ns) / 1e6, 3)
+                if self.last_started_ns > 0
+                else None
+            ),
+            "last_complete_age_ms": (
+                round((now_ns - self.last_completed_ns) / 1e6, 3)
+                if self.last_completed_ns > 0
+                else None
+            ),
             "last_error": self.last_error,
             "alive": self.thread.is_alive(),
         }
@@ -155,11 +190,19 @@ class DualPiperAerohand:
         self.arms: dict[str, Any] = {}
         self.hands: dict[str, Any] = {}
         self.arm_locks = {side: threading.Lock() for side in ("left", "right")}
+        # 仅保护内存中的完整反馈快照，不包围任何硬件 SDK 调用。
+        self.arm_cache_locks = {
+            side: threading.Lock() for side in ("left", "right")
+        }
         self.workers: dict[str, LatestCommandWorker] = {}
         self.last_hand = {side: np.zeros(7, np.float32) for side in ("left", "right")}
         self.last_arm_pose: dict[str, np.ndarray | None] = {
             side: None for side in ("left", "right")
         }
+        self.last_arm_joints: dict[str, np.ndarray | None] = {
+            side: None for side in ("left", "right")
+        }
+        self.last_arm_feedback_ns = {side: 0 for side in ("left", "right")}
         self.last_arm_target: dict[str, np.ndarray | None] = {
             side: None for side in ("left", "right")
         }
@@ -172,6 +215,11 @@ class DualPiperAerohand:
                 "last_move_p_ms": 0.0,
                 "max_move_p_ms": 0.0,
                 "last_status_poll_ns": 0,
+                "feedback_reads_command": 0,
+                "feedback_reads_state": 0,
+                "state_cache_hits": 0,
+                "state_skipped_for_command": 0,
+                "state_lock_busy": 0,
             }
             for side in ("left", "right")
         }
@@ -196,12 +244,12 @@ class DualPiperAerohand:
         for side in ("left", "right"):
             target = self.last_arm_target[side]
             first_target = self.first_arm_target[side]
-            actual = self.last_arm_pose[side]
-            diagnostics = {
-                key: value
-                for key, value in self.arm_diagnostics[side].items()
-                if key != "last_status_poll_ns"
-            }
+            with self.arm_cache_locks[side]:
+                actual = self.last_arm_pose[side]
+                actual = actual.copy() if actual is not None else None
+                feedback_ns = self.last_arm_feedback_ns[side]
+            diagnostics = self.arm_diagnostics[side].copy()
+            diagnostics.pop("last_status_poll_ns", None)
             diagnostics["target"] = (
                 target.tolist() if target is not None else None
             )
@@ -216,6 +264,11 @@ class DualPiperAerohand:
             diagnostics["tracking_error_m"] = (
                 round(float(np.linalg.norm(target[:3] - actual[:3])), 6)
                 if target is not None and actual is not None
+                else None
+            )
+            diagnostics["feedback_age_ms"] = (
+                round((time.perf_counter_ns() - feedback_ns) / 1e6, 3)
+                if feedback_ns > 0
                 else None
             )
             arm_status[side] = diagnostics
@@ -261,10 +314,16 @@ class DualPiperAerohand:
         joints = arm.get_joint_angles()
         if flange is None or joints is None:
             raise RuntimeError(f"{side} Piper 未返回完整状态")
-        return (
-            self._message_array(flange, (6,)),
-            self._message_array(joints, (6,)),
-        )
+        flange_array = self._message_array(flange, (6,))
+        joints_array = self._message_array(joints, (6,))
+        # 用完整快照更新缓存。状态线程只读副本，不再为了100Hz组帧而持续
+        # 与 move_p 争抢同一个机械臂 SDK。
+        feedback_ns = time.perf_counter_ns()
+        with self.arm_cache_locks[side]:
+            self.last_arm_pose[side] = flange_array.copy()
+            self.last_arm_joints[side] = joints_array.copy()
+            self.last_arm_feedback_ns[side] = feedback_ns
+        return flange_array, joints_array
 
     def _read_hand_feedback(self, side: str) -> np.ndarray:
         state = self.hands[side].get_joint_positions_compact()
@@ -585,6 +644,11 @@ class DualPiperAerohand:
                         # 不在第一条 move_p 后立即读取，避免拿到上一会话残留状态；
                         # 首次诊断在配置的轮询周期后进行。
                         "last_status_poll_ns": time.perf_counter_ns(),
+                        "feedback_reads_command": 0,
+                        "feedback_reads_state": 0,
+                        "state_cache_hits": 0,
+                        "state_skipped_for_command": 0,
+                        "state_lock_busy": 0,
                     }
 
                 for side in ("left", "right"):
@@ -617,10 +681,16 @@ class DualPiperAerohand:
         with self.arm_locks[side]:
             started_ns = time.perf_counter_ns()
             self.arms[side].move_p(target.tolist())
-            duration_ms = (time.perf_counter_ns() - started_ns) / 1e6
+            move_done_ns = time.perf_counter_ns()
+
+            # 沿用此前真机成功方案：同一个单侧 I/O 线程按顺序执行
+            # move_p -> 状态回读。禁止另一个100Hz线程并发调用同一 SDK。
+            self._read_arm_feedback(side)
+            duration_ms = (move_done_ns - started_ns) / 1e6
 
             diagnostics = self.arm_diagnostics[side]
             diagnostics["move_p_calls"] += 1
+            diagnostics["feedback_reads_command"] += 1
             diagnostics["last_move_p_ms"] = round(duration_ms, 3)
             diagnostics["max_move_p_ms"] = round(
                 max(float(diagnostics["max_move_p_ms"]), duration_ms), 3
@@ -715,12 +785,60 @@ class DualPiperAerohand:
             raise RuntimeError("机器人硬件尚未 initialize")
         states: dict[str, RobotState] = {}
         for side in ("left", "right"):
-            with self.arm_locks[side]:
-                flange, joints = self._read_arm_feedback(side)
-                self.last_arm_pose[side] = flange.copy()
+            diagnostics = self.arm_diagnostics[side]
+            worker = self.workers.get(f"arm_{side}")
+            now_ns = time.perf_counter_ns()
+            feedback_interval_ns = int(
+                1e9 / float(self.cfg.get("arm_feedback_hz", 30.0))
+            )
+            with self.arm_cache_locks[side]:
+                cached_pose = self.last_arm_pose[side]
+                cached_joints = self.last_arm_joints[side]
+                cached_feedback_ns = self.last_arm_feedback_ns[side]
+            cache_ready = cached_pose is not None and cached_joints is not None
+            cache_fresh = (
+                cache_ready
+                and now_ns - cached_feedback_ns < feedback_interval_ns
+            )
+
+            if worker is not None:
+                # ACTIVE 期间该侧所有 SDK I/O 都归 arm worker 所在线程：
+                # _send_arm 会按 move_p -> feedback 更新完整缓存。即使加锁能
+                # 避免同时进入 SDK，也不能保证第三方 SDK 支持跨线程串行调用。
+                diagnostics["state_cache_hits"] += 1
+                if worker.has_pending_work:
+                    diagnostics["state_skipped_for_command"] += 1
+            elif cache_fresh:
+                diagnostics["state_cache_hits"] += 1
+            elif self.arm_locks[side].acquire(blocking=False):
+                try:
+                    self._read_arm_feedback(side)
+                    diagnostics["feedback_reads_state"] += 1
+                finally:
+                    self.arm_locks[side].release()
+            else:
+                diagnostics["state_lock_busy"] += 1
+
+            # initialize/prepare_start 已建立首个缓存；仅保留防御性兜底。
+            if not cache_ready:
+                with self.arm_locks[side]:
+                    self._read_arm_feedback(side)
+                    diagnostics["feedback_reads_state"] += 1
+
+            with self.arm_cache_locks[side]:
+                flange = self.last_arm_pose[side].copy()
+                joints = self.last_arm_joints[side].copy()
 
             states[side] = RobotState(flange, joints, self.last_hand[side].copy())
         return BimanualRobotState(states["left"], states["right"])
+
+    def feedback_timestamps_ns(self) -> dict[str, int]:
+        """返回与 read_state 缓存对应的各侧真实反馈单调时钟时间。"""
+        result: dict[str, int] = {}
+        for side in ("left", "right"):
+            with self.arm_cache_locks[side]:
+                result[side] = int(self.last_arm_feedback_ns[side])
+        return result
 
     def deactivate(self) -> None:
         """episode stop：停止下发并 disable 双臂，保留 CAN/串口硬件会话。"""
