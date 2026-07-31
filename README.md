@@ -176,6 +176,18 @@ TCP 和左右工作空间标定。
 不会跳转到配置中的另一套姿态。只有经过可达性验证后，才应显式改为
 `orientation_mode: configured_fixed` 并使用 `fixed_orientation`。
 
+相对位置控制沿用已验证工程的映射：
+
+```text
+Piper目标位置 = start时真实法兰位置 + VIVE相对位移映射
+robot_dx = -vive_dz * vive_scale
+robot_dy = -vive_dx * vive_scale
+robot_dz =  vive_dy * vive_scale
+```
+
+左右 VIVE 参考必须由同一个有效网络包原子建立。任一侧 VIVE、MANUS 或 `valid`
+无效时不会建立/修改参考，也不会向双臂和双手发送新目标；数据恢复后继续使用原参考。
+
 ## LeRobot 双侧字段
 
 - `observation.state`：左臂/左手在前，右臂/右手在后；单手 7 DOF，共 38 维。

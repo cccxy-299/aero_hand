@@ -276,13 +276,17 @@ def _control_process(
             )
             return
         try:
-            # 每个 episode 都从真实当前位置重新建立 VIVE 参考和安全门历史；
-            # 机器人 SDK 实例本身不重建。
+            # 先完成双臂使能与控制器健康检查，再读取真实法兰反馈。
+            # 这与旧方案“机械臂已就绪后 activate_teleop() 建立相对参考”一致，
+            # 避免把 disable 状态下可能滞后的反馈作为首帧控制基准。
+            robot.activate()
+
+            # 每个 episode 都从 start 后的真实当前位置重新建立 VIVE 参考和
+            # 安全门历史；机器人 SDK 实例本身不重建。
             current_state = robot.read_state()
             candidate_retargeter, candidate_safety = (
                 _make_episode_control_components(cfg, current_state)
             )
-            robot.activate()
             retargeter = candidate_retargeter
             safety = candidate_safety
             teleop_buffer.clear()
@@ -456,6 +460,9 @@ def _control_process(
 
         last_report_ns = time.perf_counter_ns()
         period_ns = int(1e9 / float(cfg["rates"]["control_hz"]))
+        teleop_timeout_ns = int(
+            float(cfg["alignment"]["teleop_timeout_ms"]) * 1e6
+        )
         deadline_ns = time.perf_counter_ns()
         while not stop_event.is_set():
             if not active:
@@ -480,30 +487,51 @@ def _control_process(
                 metrics["stale_teleop"] += 1
             else:
                 try:
-                    command = retargeter.retarget(selected.value, selected.seq)
-                    safe_by_side: dict[str, ControlCommand] = {}
-                    for side in SIDES:
-                        side_command: TeleopCommand = getattr(command, side)
-                        safe_by_side[side] = safety[side].apply(
-                            side_command, tick_start_ns - selected.local_mono_ns
-                        )
-                    safe = BimanualControlCommand(
-                        safe_by_side["left"], safe_by_side["right"], selected.seq
-                    )
-                    robot.command(safe)
-                    action_stamp_ns = time.perf_counter_ns()
-                    _put_latest(
-                        sample_queue,
-                        TimedSample(
-                            "control_action",
-                            selected.seq,
-                            selected.source_mono_ns,
-                            action_stamp_ns,
-                            safe,
-                        ),
-                    )
-                    if safe.left.safety_flags & 1 or safe.right.safety_flags & 1:
+                    teleop_age_ns = tick_start_ns - selected.local_mono_ns
+                    if teleop_age_ns > teleop_timeout_ns:
+                        # 过期包不能用于建立 VIVE 零点，也不应继续刷新手部命令。
+                        # 硬件命令线程会自然保持最后一条已接受的安全目标。
                         metrics["stale_teleop"] += 1
+                    else:
+                        command = retargeter.retarget(
+                            selected.value, selected.seq
+                        )
+                        if not command.left.valid or not command.right.valid:
+                            # 与旧方案的“Tracker 丢失时不发送新目标”一致；
+                            # 双侧系统采用左右联锁，任一侧无效时均保持上一目标。
+                            metrics["stale_teleop"] += 1
+                        else:
+                            safe_by_side: dict[str, ControlCommand] = {}
+                            for side in SIDES:
+                                side_command: TeleopCommand = getattr(
+                                    command, side
+                                )
+                                safe_by_side[side] = safety[side].apply(
+                                    side_command,
+                                    teleop_age_ns,
+                                )
+                            safe = BimanualControlCommand(
+                                safe_by_side["left"],
+                                safe_by_side["right"],
+                                selected.seq,
+                            )
+                            robot.command(safe)
+                            action_stamp_ns = time.perf_counter_ns()
+                            _put_latest(
+                                sample_queue,
+                                TimedSample(
+                                    "control_action",
+                                    selected.seq,
+                                    selected.source_mono_ns,
+                                    action_stamp_ns,
+                                    safe,
+                                ),
+                            )
+                            if (
+                                safe.left.safety_flags & 1
+                                or safe.right.safety_flags & 1
+                            ):
+                                metrics["stale_teleop"] += 1
                 except (KeyError, TypeError, ValueError):
                     metrics["stale_teleop"] += 1
                     LOG.warning(
@@ -522,6 +550,15 @@ def _control_process(
                     metrics=dict(metrics),
                     active=True,
                     hardware=robot.status_snapshot(),
+                    teleop_reference_ready=getattr(
+                        retargeter, "references_ready", None
+                    ),
+                    teleop_reference_source_seq=getattr(
+                        retargeter, "reference_source_seq", None
+                    ),
+                    teleop_reference=getattr(
+                        retargeter, "reference_snapshot", lambda: {}
+                    )(),
                 )
                 last_report_ns = now_ns
             deadline_ns += period_ns
