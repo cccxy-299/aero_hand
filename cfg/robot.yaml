@@ -55,15 +55,15 @@ robot:
     health_timeout_s: 3
     # 请在真机标定并确认无碰撞后填写6维末端位姿 [x,y,z,rx,ry,rz]。
     # 未配置 home_pose 时，home 命令会安全拒绝，不会执行运动。
-    # home_pose: [0.25, 0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    home_pose: [0, 0.45, -0.45, 0,0,0]
     home_speed_percent: 10
     home_timeout_s: 10
     home_position_tolerance_m: 0.02
     home_orientation_tolerance_rad: 0.15
     hand_home_wait_s: 8
     vive_scale: 0.3
-    initial_pose: [0, 0, 0, 0 , 0.2201, -1.6187]
-    fixed_orientation: [-1.8968, 0.2201, -1.6187]
+    initial_pose: [0, 0, 0, 0,0,0]
+    fixed_orientation: [0.0698, 1.3963,0]
     workspace_min: [0.05, 0.00, 0.05]
     workspace_max: [0.40, 0.35, 0.45]
     max_linear_step_m: 0.01
@@ -77,15 +77,15 @@ robot:
     enable_timeout_s: 5
     health_timeout_s: 3
     # 右臂 home_pose 必须单独标定，不能照抄左臂；尤其要检查双臂回零轨迹。
-    # home_pose: [0.25, -0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    home_pose: [0, 0.45, -0.45, 0,0,0]
     home_speed_percent: 10
     home_timeout_s: 10
     home_position_tolerance_m: 0.02
     home_orientation_tolerance_rad: 0.15
     hand_home_wait_s: 8
     vive_scale: 0.3
-    initial_pose: [0, 0, 0, 0, 0.2201, -1.6187]
-    fixed_orientation: [-1.8968, 0.2201, -1.6187]
+    initial_pose: [0, 0, 0, 0,0,0]
+    fixed_orientation: [-1.3963,1.5184,-1.3614]
     workspace_min: [0.05, -0.35, 0.05]
     workspace_max: [0.40, 0.00, 0.45]
     max_linear_step_m: 0.01

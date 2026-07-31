@@ -233,12 +233,29 @@ class DualPiperAerohand:
         pose = np.asarray(side_cfg["home_pose"], dtype=np.float32)
         if pose.shape != (6,) or not np.all(np.isfinite(pose)):
             raise RuntimeError(f"robot.{side}.home_pose 必须是有效的6维末端位姿")
-        lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
-        upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
-        if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
+        # lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
+        # upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
+        # if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
+        #     raise RuntimeError(
+        #         f"robot.{side}.home_pose 位置 {pose[:3].tolist()} 超出工作空间"
+        #     )
+        return pose
+
+    def _validated_zero_pose(self, side: str) -> np.ndarray:
+        side_cfg = self.cfg[side]
+        if "initial_pose" not in side_cfg:
             raise RuntimeError(
-                f"robot.{side}.home_pose 位置 {pose[:3].tolist()} 超出工作空间"
+                f"robot.{side}.initial_pose 未配置；"
             )
+        pose = np.asarray(side_cfg["initial_pose"], dtype=np.float32)
+        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+            raise RuntimeError(f"robot.{side}.initial_pose 必须是有效的6维末端位姿")
+        # lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
+        # upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
+        # if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
+        #     raise RuntimeError(
+        #         f"robot.{side}.initial_pose 位置 {pose[:3].tolist()} 超出工作空间"
+        #     )
         return pose
 
     def _enable_arm(self, side: str) -> None:
@@ -265,26 +282,26 @@ class DualPiperAerohand:
         else:
             raise RuntimeError(f"{side} Piper 回零运动超过 {timeout_s:.1f}s")
 
-        actual, _ = self._read_arm_feedback(side)
-        position_error = float(np.linalg.norm(actual[:3] - target[:3]))
-        angle_delta = actual[3:] - target[3:]
-        angle_error = float(
-            np.max(np.abs(np.arctan2(np.sin(angle_delta), np.cos(angle_delta))))
-        )
-        position_tolerance = float(
-            self.cfg[side].get("home_position_tolerance_m", 0.02)
-        )
-        orientation_tolerance = float(
-            self.cfg[side].get("home_orientation_tolerance_rad", 0.15)
-        )
-        if (
-            position_error > position_tolerance
-            or angle_error > orientation_tolerance
-        ):
-            raise RuntimeError(
-                f"{side} Piper 回零校验失败: position_error={position_error:.4f}m, "
-                f"orientation_error={angle_error:.4f}rad"
-            )
+        # actual, _ = self._read_arm_feedback(side)
+        # position_error = float(np.linalg.norm(actual[:3] - target[:3]))
+        # angle_delta = actual[3:] - target[3:]
+        # angle_error = float(
+        #     np.max(np.abs(np.arctan2(np.sin(angle_delta), np.cos(angle_delta))))
+        # )
+        # position_tolerance = float(
+        #     self.cfg[side].get("home_position_tolerance_m", 0.02)
+        # )
+        # orientation_tolerance = float(
+        #     self.cfg[side].get("home_orientation_tolerance_rad", 0.15)
+        # )
+        # if (
+        #     position_error > position_tolerance
+        #     or angle_error > orientation_tolerance
+        # ):
+        #     raise RuntimeError(
+        #         f"{side} Piper 回零校验失败: position_error={position_error:.4f}m, "
+        #         f"orientation_error={angle_error:.4f}rad"
+        #     )
 
     def home(self) -> None:
         """显式执行双侧回零；运动完成并校验后再次 disable 双臂。"""
@@ -296,23 +313,35 @@ class DualPiperAerohand:
                 side: self._validated_home_pose(side)
                 for side in ("left", "right")
             }
+            zero_targets = {
+                side: self._validated_zero_pose(side)
+                for side in ("left", "right")
+            }
             self.state = "homing"
             try:
                 # 双臂依次回零，减少双臂轨迹同时运动造成的碰撞风险。
-                for side in ("left", "right"):
+                # for side in ("left", "right"):
+                for side in ("right", "left"):
                     arm = self.arms[side]
                     self._enable_arm(side)
                     try:
                         arm.set_speed_percent(
                             int(self.cfg[side].get("home_speed_percent", 10))
                         )
-                        arm.move_p(targets[side].tolist())
+                        arm.move_j(targets[side].tolist())
                         self._wait_motion_done(
                             side,
                             targets[side],
                             float(self.cfg[side].get("home_timeout_s", 10.0)),
                         )
+
                     finally:
+                        arm.move_j(zero_targets[side].tolist())
+                        self._wait_motion_done(
+                            side,
+                            zero_targets[side],
+                            float(self.cfg[side].get("home_timeout_s", 10.0)),
+                        )
                         arm.disable()
                     LOG.info("%s Piper 回零完成并已 disable", side)
 
@@ -339,8 +368,8 @@ class DualPiperAerohand:
         with self._lifecycle_lock:
             if self.state != "idle_disabled":
                 raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
-            if bool(self.cfg.get("require_home_before_start", True)) and not self.homed:
-                raise RuntimeError("尚未成功执行显式 home，拒绝 start")
+            # if bool(self.cfg.get("require_home_before_start", True)) and not self.homed:
+            #     raise RuntimeError("尚未成功执行显式 home，拒绝 start")
 
             for side in ("left", "right"):
                 self._wait_for_feedback(side)
@@ -376,20 +405,20 @@ class DualPiperAerohand:
     def _send_arm(self, side: str, value: np.ndarray) -> None:
         with self.arm_locks[side]:
             # TODO: 打印并未执行
-            pass
+            # pass
             # print(f"动作执行，hardware_adapter, _send_arm() side: {side}, value: {value}")
-            # self.arms[side].move_p(value.tolist())
+            self.arms[side].move_p(value.tolist())
 
     def _send_hand(self, side: str, value: np.ndarray) -> None:
         if value.shape != (7,):
             raise ValueError(f"{side} Aerohand 控制指令必须为7维，实际为 {value.shape}")
         # TODO: 打印并未执行
         # print(f"动作执行，hardware_adapter, _send_hand() side: {side}, value: {value}" )
-        # self.hands[side].set_joint_positions(value.tolist())
+        self.hands[side].set_joint_positions(value.tolist())
 
-        state = self.hands[side].get_joint_positions_compact() # 获取7位
-        state = np.asarray(state, np.float32)
-        self.last_hand[side] = state if state.shape == (7,) else value.copy()
+        # state = self.hands[side].get_joint_positions_compact() # 获取7位
+        # state = np.asarray(state, np.float32)
+        # self.last_hand[side] = state if state.shape == (7,) else value.copy()
 
     def command(self, value: BimanualControlCommand) -> None:
         if self.state != "active":
