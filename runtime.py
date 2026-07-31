@@ -25,10 +25,10 @@ from retarget import (
     SideRetargetConfig,
 )
 from hardware_adapters import (
-            DualPiperAerohand,
-            IntelRealSenseColorCamera,
-            TechNexionCamera,
-        )
+    DualPiperAerohand,
+    IntelRealSenseColorCamera,
+    OpenCVWristCamera,
+)
 from safety import SafetyConfig, SafetyGate
 
 
@@ -62,14 +62,14 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpRe
                 cameras["height"],
                 int(cfg["rates"]["camera_hz"]),
             ),
-            "wrist_left": TechNexionCamera(
+            "wrist_left": OpenCVWristCamera(
                 cameras["wrist_left"],
                 "wrist_left",
                 cameras["width"],
                 cameras["height"],
                 int(cfg["rates"]["camera_hz"]),
             ),
-            "wrist_right": TechNexionCamera(
+            "wrist_right": OpenCVWristCamera(
                 cameras["wrist_right"],
                 "wrist_right",
                 cameras["width"],

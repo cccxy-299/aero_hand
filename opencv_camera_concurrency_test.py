@@ -504,10 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="dual-thread",
     )
     parser.add_argument(
-        "--left-device", type=_parse_device, default="/dev/video0"
+        "--left-device", type=_parse_device, default="/dev/video6"
     )
     parser.add_argument(
-        "--right-device", type=_parse_device, default="/dev/video2"
+        "--right-device", type=_parse_device, default="/dev/video8"
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
@@ -593,4 +593,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

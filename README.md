@@ -109,8 +109,9 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
 - `source_fps_*`：相机真正产生唯一画面的速率，不是配置中的轮询频率。
 - `unique_ratio_*`：写入 frame 中实际使用的新相机画面比例；其余为维持真实时间轴而
   重复使用的上一帧。
-- `camera_frame_errors_*` 与 `camera_error_ratio_*`：SDK失败、空MJPEG包及损坏帧
-  的累计数量和占总取帧结果的比例；`camera_<reason>_*` 会进一步区分错误原因。
+- `camera_frame_errors_*` 与 `camera_error_ratio_*`：V4L2/RealSense 取帧失败、
+  空帧及异常帧的累计数量和占总取帧结果的比例；`camera_<reason>_*` 会进一步
+  区分错误原因。
 
 默认质量门限为每路相机至少 24 FPS、唯一画面比例至少 0.70、坏帧比例不超过
 0.10。任一路不达标时输出
@@ -133,7 +134,7 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
         +-- wrist_right相机进程-> 一帧共享内存
 ```
 
-设备 B 固定使用 `spawn`，控制进程不会加载相机或 LeRobot 编码依赖。三路相机 SDK
+设备 B 固定使用 `spawn`，控制进程不会加载相机或 LeRobot 编码依赖。三路相机后端
 和 MJPEG 解码各自在独立 OS 进程中运行，即使某个 C 扩展持有 Python GIL，也不会
 阻塞其他相机或 30 Hz 组帧循环。图像不经过 multiprocessing Queue/pickle，而是每路
 只发布一帧共享内存，记录进程按周期复制最新帧。原始图像不做跨进程序列化传输；
@@ -148,7 +149,7 @@ Queue IPC 只传递遥操作、机器人状态和最终动作。队列溢出时�
 - `retarget.py`：设备 B 直接使用 A 发来的7维手指令，只把 VIVE 相对位移映射到
   左右 Piper 基座坐标系。
 - `hardware_adapters.py`：通过 `pyAgxArm` 控制双 Piper，通过 `aero_open_sdk`
-  控制双 Aerohand；左右腕相机复用 TechNexion 接口，全景相机使用 Intel
+  控制双 Aerohand；左右腕相机通过 OpenCV/V4L2 采集，全景相机使用 Intel
   RealSense 的 RGB8 彩色流（不启用深度流）。
 - CAN 和串口下发各有容量为 1 的最新值工作队列；硬件 SDK 卡顿不会阻塞控制线程。
 
@@ -167,94 +168,39 @@ TCP 和左右工作空间标定。
 - `observation.images.wrist_right`：右腕相机。
 - `diagnostics.safety_flags`：两维，依次为左、右安全标志。
 
-## TechNexion 腕部相机
+## OpenCV/V4L2 双腕相机
 
-腕部相机默认使用 `format_idx: null`，连接时从设备报告的 MJPG 模式中自动选择目标
-分辨率且最接近 `camera_hz` 的格式。`strict_fps: true` 会在设备只能提供低帧率模式时
-拒绝开始 episode，而不是以 30 Hz 反复读取同一张画面。若必须手动指定
-`format_idx`，应先查看启动日志中的完整格式列表，并确认选中模式为 30 FPS。
-
-VizionSDK 的单次失败返回码、空 MJPEG buffer 或损坏 JPEG 只会丢弃当前帧，上一张
-有效共享内存画面保持可用；恢复后继续当前 episode。只有连续
-`camera_failure_timeout_ms`（默认 1500 ms）没有任何有效图像才会停止系统。这样既
-不会因一个 USB 瞬时坏包误停机，也不会在相机真正离线后继续控制和保存坏数据。
-
-### 双相机并发诊断
-
-`camera_concurrency_test.py` 完全不启动机器人、LeRobot Writer、RealSense或视频
-编码器，只测试两台 TechNexion 的 VizionSDK 取流。真机排查时依次执行：
-
-```bash
-# 1. 各自单测30秒
-python camera_concurrency_test.py --mode single-left --duration-s 30
-python camera_concurrency_test.py --mode single-right --duration-s 30
-
-# 2. 同一进程、两个线程（接近旧Demo结构）
-python camera_concurrency_test.py --mode dual-thread --duration-s 30
-
-# 3. 两个独立进程（与正式采集结构一致）
-python camera_concurrency_test.py --mode dual-process --duration-s 30
-
-# 4. 模拟正式程序的30Hz轮询；默认 poll-hz=0 会尽快持续排空SDK
-python camera_concurrency_test.py --mode dual-process --poll-hz 30 --duration-s 30
-
-# 5. 扫描左/右相机报告的每个MJPG format
-python camera_concurrency_test.py --mode sweep-left --sweep-duration-s 10
-python camera_concurrency_test.py --mode sweep-right --sweep-duration-s 10
-```
-
-默认启用 `--prestart-drain`：两路 `VxStartStreaming()` 后、统一计时开始前也会持续
-调用 `VxGetImage()`，避免 SDK/UVC 启动缓冲池因同步等待而塞满。可用
-`--no-prestart-drain` 复现旧测试时序并进行 A/B 对比，但不要用该模式判断正式采集
-架构是否稳定。日志中的 `warmup_frames`、`warmup_errors` 只用于诊断，不计入正式
-`source_fps` 和 `error_ratio`。
-
-若已从启动日志确认稳定的格式索引，可显式比较，例如：
-
-```bash
-python camera_concurrency_test.py \
-  --mode dual-process \
-  --left-format-idx 1 \
-  --right-format-idx 1 \
-  --no-strict-fps \
-  --timeout-ms 1000 \
-  --duration-s 60
-```
-
-每秒输出一条JSON `progress`，结束输出 `summary` 和 `verdict`。重点查看
-`sdk_timeout`、`source_fps`、`error_ratio`、`max_gap_ms` 和
-`max_consecutive_errors`。单测均正常但 `dual-thread` 失败，优先检查SDK双设备或USB；
-`dual-thread` 正常而 `dual-process` 失败，优先检查VizionSDK跨进程兼容性；
-默认持续取流正常但 `--poll-hz 30` 失败，说明SDK需要持续排空，正式相机进程不应额外
-限频；只有部分 format 稳定时，应在 `robot.yaml` 固定各自已验证的索引。
-
-## 纯 OpenCV 双腕相机测试
-
-`opencv_camera.py` 是不依赖 `pyvizionsdk` 的同步相机类；
-`opencv_camera_concurrency_test.py` 是独立测试程序。它们当前没有接入
-`hardware_adapters.py` 或主 pipeline。
+`opencv_camera.py` 是不依赖 `pyvizionsdk` 的同步相机类，已经通过
+`OpenCVWristCamera` 接入主 pipeline。正式采集为左右腕相机各一个 spawn 子进程，
+每个进程直接调用 `VideoCapture.read()`，在进程内完成 MJPG 解码与 BGR→RGB
+转换，再通过各自的一帧共享内存发布给 recorder。
 
 先在 Linux 上确认设备节点和相机支持的格式：
 
 ```bash
 v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video0 --list-formats-ext
-v4l2-ctl -d /dev/video2 --list-formats-ext
+v4l2-ctl -d /dev/video6 --list-formats-ext
+v4l2-ctl -d /dev/video8 --list-formats-ext
 ls -l /dev/v4l/by-id/
 ```
 
-默认测试 `/dev/video0` 和 `/dev/video2`，以 `640x480 MJPG 30 FPS` 打开：
+当前真机配置使用 `/dev/video6` 和 `/dev/video8`，以
+`640x480 MJPG 30 FPS` 打开：
 
 ```bash
 # 两只相机分别运行60秒
-python opencv_camera_concurrency_test.py --mode single-left --duration-s 60
-python opencv_camera_concurrency_test.py --mode single-right --duration-s 60
+python opencv_camera_concurrency_test.py --mode single-left \
+  --left-device /dev/video6 --duration-s 60
+python opencv_camera_concurrency_test.py --mode single-right \
+  --right-device /dev/video8 --duration-s 60
 
 # 单进程、每只相机一个采集线程
-python opencv_camera_concurrency_test.py --mode dual-thread --duration-s 60
+python opencv_camera_concurrency_test.py --mode dual-thread \
+  --left-device /dev/video6 --right-device /dev/video8 --duration-s 60
 
 # 每只相机一个独立 spawn 子进程
-python opencv_camera_concurrency_test.py --mode dual-process --duration-s 60
+python opencv_camera_concurrency_test.py --mode dual-process \
+  --left-device /dev/video6 --right-device /dev/video8 --duration-s 60
 ```
 
 设备节点不同时显式传入；正式配置建议使用 `/dev/v4l/by-id/...` 稳定路径：
@@ -262,8 +208,8 @@ python opencv_camera_concurrency_test.py --mode dual-process --duration-s 60
 ```bash
 python opencv_camera_concurrency_test.py \
   --mode dual-process \
-  --left-device /dev/video0 \
-  --right-device /dev/video2 \
+  --left-device /dev/video6 \
+  --right-device /dev/video8 \
   --width 640 \
   --height 480 \
   --fps 30 \
@@ -274,9 +220,14 @@ python opencv_camera_concurrency_test.py \
 每秒会输出 JSON `progress`，结束时输出 `summary` 和 `verdict`。重点检查
 `actual_properties` 中实际生效的 FourCC、分辨率和 FPS，以及 `source_fps`、
 `error_ratio`、`max_gap_ms`、`last_frame_age_ms` 和 `unique_ratio`。如果线程模式
-正常而进程模式异常，优先采用单相机进程内双线程；如果两种并发模式都正常，可优先
+正常而进程模式异常，才考虑单进程内双线程；当前真机两种模式都通过，因此正式系统
 采用双进程隔离。若实际分辨率不符合要求，程序默认直接报错；调试其他模式时可临时加
 `--no-strict-resolution`。
+
+部分 OpenCV V4L2 backend 不支持 `CAP_PROP_READ_TIMEOUT_MSEC`。正式 recorder
+会独立监控共享内存中的最新帧时间戳；超过 `failure_timeout_ms` 未更新时，即使相机
+子进程仍存活，也会判定 `VideoCapture.read()` 可能卡死并终止当前采集会话。stop
+阶段若子进程不能自行退出，会依次执行 `terminate` 和 `kill`，不会拖住控制进程。
 
 ## Intel RealSense 全景相机
 

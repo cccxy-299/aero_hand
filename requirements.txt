@@ -13,4 +13,4 @@ opencv-python>=4.8
 # 若 Python/硬件 SDK 环境允许，推荐使用支持 streaming_encoding/resume 的新版：
 # lerobot>=0.6,<0.7
 # 设备 A 真机：pyzmq、pysurvive/libsurvive
-# 设备 B 真机：pyAgxArm、aero_open_sdk、pyvizionsdk、opencv-python
+# 设备 B 真机：pyAgxArm、aero_open_sdk、opencv-python

@@ -408,14 +408,14 @@ def _make_camera(cfg: dict[str, Any], name: str) -> Any:
     height = int(cameras_cfg["height"])
     fps = int(cfg["rates"]["camera_hz"])
     if bool(cfg["robot"]["enabled"]):
-        from hardware_adapters import IntelRealSenseColorCamera, TechNexionCamera
+        from hardware_adapters import IntelRealSenseColorCamera, OpenCVWristCamera
 
         if name == "scene":
             return IntelRealSenseColorCamera(
                 cameras_cfg["scene"], "scene", width, height, fps
             )
         if name in {"wrist_left", "wrist_right"}:
-            return TechNexionCamera(
+            return OpenCVWristCamera(
                 cameras_cfg[name], name, width, height, fps
             )
         raise KeyError(f"未知相机名称: {name}")
@@ -444,7 +444,7 @@ def _camera_capture_process(
     """一路相机一个 OS 进程，通过共享内存发布最新 RGB 帧。
 
     图像不经过 multiprocessing.Queue/pickle；recorder 每个组帧周期只复制
-    当前最新帧，因此相机 SDK、MJPEG 解码和 USB 阻塞均不会阻塞组帧线程。
+    当前最新帧，因此 V4L2/相机 SDK、MJPEG 解码和 USB 阻塞均不会阻塞组帧线程。
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -569,7 +569,11 @@ def _camera_capture_process(
             outage_reported = False
             if not ready_reported:
                 # connect 成功还不够；至少发布一帧后才允许机器人开始控制。
-                report("ready")
+                describe = getattr(camera, "describe", None)
+                report(
+                    "ready",
+                    details=describe() if callable(describe) else {},
+                )
                 ready_reported = True
 
             # 仿真相机读取不会阻塞；真实相机通常由硬件帧率自然限速。
@@ -886,7 +890,16 @@ def _recorder_process(
                             )
                     continue
                 if status["kind"] == "ready":
-                    ready.add(str(status["camera"]))
+                    camera_name = str(status["camera"])
+                    ready.add(camera_name)
+                    episode_diagnostics[
+                        f"camera_properties_{camera_name}"
+                    ] = status.get("details", {})
+                    LOG.info(
+                        "%s 相机进程就绪: %s",
+                        camera_name,
+                        status.get("details", {}),
+                    )
                 elif status["kind"] in {"frame_error", "recovered"}:
                     record_camera_status(status)
                 elif status["kind"] == "error":
@@ -915,7 +928,7 @@ def _recorder_process(
                 process.terminate()
                 process.join(timeout=2)
             if process.is_alive():
-                LOG.error("%s 相机 SDK 无法退出，强制 kill", name)
+                LOG.error("%s 相机后端无法退出，强制 kill", name)
                 process.kill()
                 process.join(timeout=2)
         if camera_status_queue is not None:
@@ -1008,6 +1021,7 @@ def _recorder_process(
                 if status["kind"] == "stopped" and episode_state == "recording":
                     raise RuntimeError(f"{status['camera']} 相机进程意外停止")
 
+        now_ns = time.perf_counter_ns()
         for name, channel in camera_channels.items():
             process = channel["process"]
             if process.exitcode is not None and episode_state == "recording":
@@ -1016,14 +1030,45 @@ def _recorder_process(
                 )
             with channel["lock"]:
                 seq = int(channel["seq"].value)
-                if seq < 0 or seq == last_shared_camera_seq.get(name, -1):
-                    continue
                 stamp_ns = int(channel["stamp_ns"].value)
-                image = np.ndarray(
-                    channel["shape"],
-                    dtype=np.uint8,
-                    buffer=channel["shm"].buf,
-                ).copy()
+                is_new = (
+                    seq >= 0
+                    and seq != last_shared_camera_seq.get(name, -1)
+                )
+                image = (
+                    np.ndarray(
+                        channel["shape"],
+                        dtype=np.uint8,
+                        buffer=channel["shm"].buf,
+                    ).copy()
+                    if is_new
+                    else None
+                )
+
+            # OpenCV V4L2 通常不接受 CAP_PROP_READ_TIMEOUT_MSEC。若子进程
+            # 永久阻塞在 VideoCapture.read()，它仍然存活且不会报告异常，
+            # 因此 recorder 必须根据共享帧时间戳独立检测停流。
+            if seq >= 0 and stamp_ns > 0:
+                camera_cfg = cfg.get("cameras", {}).get(name, {})
+                stall_timeout_ms = float(
+                    camera_cfg.get(
+                        "failure_timeout_ms",
+                        episode_cfg.get("camera_failure_timeout_ms", 1500),
+                    )
+                )
+                frame_age_ms = (now_ns - stamp_ns) / 1e6
+                if frame_age_ms >= stall_timeout_ms:
+                    episode_diagnostics[
+                        f"camera_stall_age_ms_{name}"
+                    ] = round(frame_age_ms, 3)
+                    raise RuntimeError(
+                        f"{name} 相机共享帧已停滞 {frame_age_ms:.1f}ms，"
+                        f"超过阈值 {stall_timeout_ms:.1f}ms；"
+                        "相机子进程可能阻塞在 VideoCapture.read()"
+                    )
+
+            if not is_new or image is None:
+                continue
             last_shared_camera_seq[name] = seq
             if stamp_ns <= camera_last_ns.get(name, -1):
                 key = f"duplicate_{name}"

@@ -26,7 +26,7 @@ episode:
   min_frames: 10
   save_on_shutdown: true
   command_queue_capacity: 32
-  # start 等待三路独立相机进程就绪；stop 超时后会强制回收卡死的 SDK 进程。
+  # start 等待三路独立相机进程就绪；stop 超时后会强制回收卡死的相机进程。
   camera_start_timeout_s: 15
   camera_shutdown_timeout_s: 5
   # 瞬时空包/损坏帧只丢当前帧；持续无有效画面超过该时间才停止整个 episode。
@@ -74,22 +74,35 @@ cameras:
   width: 640
   height: 480
   wrist_left:
-    cam_num: 0
-    # null 表示按目标分辨率和 camera_hz 自动选择底层 MJPG 模式。
-    format_idx: null
-    strict_fps: true
-    fps_tolerance: 1.0
-    # 缩短 SDK 单次阻塞时间，确保 stop 和持续故障检测可以及时响应。
-    timeout_ms: 500
-    # 相机已经隔离到独立进程，进程内部不要再套一层 Python 采集线程。
-    background_capture: false
+    driver: "opencv"
+    # 真机实测节点；正式部署建议替换为 /dev/v4l/by-id/... 稳定路径。
+    device: "/dev/video6"
+    backend: "v4l2"
+    fourcc: "MJPG"
+    fps: 30
+    buffer_size: 1
+    strict_fourcc: true
+    strict_resolution: true
+    fps_tolerance: 2.0
+    opencv_threads: 1
+    # 部分 V4L2 backend 不接受以下超时属性；recorder 另有共享帧停滞 watchdog。
+    open_timeout_ms: 5000
+    read_timeout_ms: 2000
+    failure_timeout_ms: 2500
   wrist_right:
-    cam_num: 1
-    format_idx: null
-    strict_fps: true
-    fps_tolerance: 1.0
-    timeout_ms: 500
-    background_capture: false
+    driver: "opencv"
+    device: "/dev/video8"
+    backend: "v4l2"
+    fourcc: "MJPG"
+    fps: 30
+    buffer_size: 1
+    strict_fourcc: true
+    strict_resolution: true
+    fps_tolerance: 2.0
+    opencv_threads: 1
+    open_timeout_ms: 5000
+    read_timeout_ms: 2000
+    failure_timeout_ms: 2500
   scene:
     driver: "realsense"
     # 只有连接多台RealSense时才需要填写序列号；单台时可以留空。

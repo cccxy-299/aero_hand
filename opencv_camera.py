@@ -38,6 +38,7 @@ class OpenCVCameraConfig:
     buffer_size: int = 1
     open_timeout_ms: int = 5000
     read_timeout_ms: int = 2000
+    strict_fourcc: bool = True
     strict_resolution: bool = True
     fps_tolerance: float = 2.0
     name: str = "opencv-camera"
@@ -158,6 +159,14 @@ class OpenCVCamera:
                 ),
                 "property_set_results": dict(self._property_results),
             }
+            if (
+                cfg.strict_fourcc
+                and str(actual["fourcc"]).upper() != cfg.fourcc.upper()
+            ):
+                raise OpenCVCameraError(
+                    f"{cfg.name} FourCC设置未生效：requested="
+                    f"{cfg.fourcc}, actual={actual['fourcc']!r}"
+                )
             if cfg.strict_resolution and (
                 actual["width"] != cfg.width
                 or actual["height"] != cfg.height

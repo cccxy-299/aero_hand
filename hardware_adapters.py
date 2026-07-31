@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import logging
 import queue
-import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -197,45 +195,66 @@ class DualPiperAerohand:
         self.hands.clear()
 
 
-class TechNexionCamera:
-    """复用参考 Demo 的 CameraInterface，并保留真实采集时间戳。"""
+class OpenCVWristCamera:
+    """基于 OpenCV/V4L2 的腕部相机适配器。
 
-    def __init__(self, cfg: dict[str, Any], name: str, width: int, height: int, fps: int) -> None:
-        demo_dir = Path(__file__).resolve().parents[1] / "lerobot_demo"
-        if str(demo_dir) not in sys.path:
-            sys.path.insert(0, str(demo_dir))
+    该适配器自身不创建线程。正式 pipeline 已经为左右腕相机分别创建独立的
+    spawn 子进程，因此 ``VideoCapture.read``、MJPG 解码和颜色转换都不会阻塞
+    recorder 或控制进程。
+    """
+
+    def __init__(
+        self,
+        cfg: dict[str, Any],
+        name: str,
+        width: int,
+        height: int,
+        fps: int,
+    ) -> None:
         try:
-            from camera import CameraInterface
-        except (ImportError, ModuleNotFoundError) as exc:
-            raise RuntimeError("TechNexion 相机模式需要 pyvizionsdk 和 opencv") from exc
-        self.camera = CameraInterface(
-            cam_num=int(cfg["cam_num"]),
-            fps=fps,
-            format_idx=(
-                int(cfg["format_idx"])
-                if cfg.get("format_idx") is not None
-                else None
-            ),
-            name=name,
-            target_width=width,
-            target_height=height,
-            timeout_ms=int(cfg.get("timeout_ms", 1000)),
-            warmup_timeout_s=float(cfg.get("warmup_timeout_s", 5.0)),
-            strict_fps=bool(cfg.get("strict_fps", True)),
-            fps_tolerance=float(cfg.get("fps_tolerance", 1.0)),
-            # 每路相机已由独立 OS 进程承载，不再在进程内套采集线程。
-            background_capture=bool(cfg.get("background_capture", False)),
+            from opencv_camera import OpenCVCamera, OpenCVCameraConfig
+        except ImportError as exc:
+            raise RuntimeError("腕部相机需要安装 opencv-python") from exc
+
+        self.name = name
+        self.opencv_threads = int(cfg.get("opencv_threads", 1))
+        self.camera = OpenCVCamera(
+            OpenCVCameraConfig(
+                device=cfg["device"],
+                width=int(width),
+                height=int(height),
+                fps=float(cfg.get("fps", fps)),
+                fourcc=str(cfg.get("fourcc", "MJPG")).upper(),
+                backend=str(cfg.get("backend", "v4l2")),
+                buffer_size=int(cfg.get("buffer_size", 1)),
+                open_timeout_ms=int(cfg.get("open_timeout_ms", 5000)),
+                read_timeout_ms=int(cfg.get("read_timeout_ms", 2000)),
+                strict_fourcc=bool(cfg.get("strict_fourcc", True)),
+                strict_resolution=bool(
+                    cfg.get("strict_resolution", True)
+                ),
+                fps_tolerance=float(cfg.get("fps_tolerance", 2.0)),
+                name=name,
+            )
         )
 
     def connect(self) -> None:
+        # 每个相机位于独立进程；限制 OpenCV 内部线程，避免与视频编码器争抢 CPU。
+        import cv2
+
+        cv2.setNumThreads(self.opencv_threads)
         self.camera.connect()
+        LOG.info("%s OpenCV相机已连接: %s", self.name, self.camera.describe())
 
     def read(self) -> tuple[np.ndarray, int]:
-        image, timestamp_s = self.camera.get_rgb_with_timestamp()
-        return image, int(timestamp_s * 1e9)
+        # OpenCV 输出 BGR；在相机子进程内转换为 LeRobot 需要的 RGB。
+        return self.camera.read_rgb()
 
     def disconnect(self) -> None:
         self.camera.disconnect()
+
+    def describe(self) -> dict[str, Any]:
+        return self.camera.describe()
 
 
 class IntelRealSenseColorCamera:

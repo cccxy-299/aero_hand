@@ -68,6 +68,49 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("cameras.scene.fps must be positive")
     if int(scene.get("timeout_ms", 1000)) <= 0:
         raise ValueError("cameras.scene.timeout_ms must be positive")
+    wrist_devices: list[str] = []
+    for camera in ("wrist_left", "wrist_right"):
+        wrist = cfg["cameras"][camera]
+        if wrist.get("driver") != "opencv":
+            raise ValueError(f"cameras.{camera}.driver 必须为 opencv")
+        device = wrist.get("device")
+        if device is None or (
+            isinstance(device, str) and not device.strip()
+        ):
+            raise ValueError(f"cameras.{camera}.device 不能为空")
+        wrist_devices.append(str(device))
+        if str(wrist.get("backend", "v4l2")).lower() not in {
+            "v4l2",
+            "any",
+        }:
+            raise ValueError(
+                f"cameras.{camera}.backend 必须为 v4l2 或 any"
+            )
+        fourcc = str(wrist.get("fourcc", "MJPG"))
+        if len(fourcc) != 4:
+            raise ValueError(
+                f"cameras.{camera}.fourcc 必须为4个字符"
+            )
+        for name, default in (
+            ("buffer_size", 1),
+            ("open_timeout_ms", 5000),
+            ("read_timeout_ms", 2000),
+            ("opencv_threads", 1),
+        ):
+            if int(wrist.get(name, default)) <= 0:
+                raise ValueError(
+                    f"cameras.{camera}.{name} must be positive"
+                )
+        if float(wrist.get("fps", cfg["rates"]["camera_hz"])) <= 0:
+            raise ValueError(f"cameras.{camera}.fps must be positive")
+        if float(wrist.get("fps_tolerance", 2.0)) < 0:
+            raise ValueError(
+                f"cameras.{camera}.fps_tolerance must be non-negative"
+            )
+    if wrist_devices[0] == wrist_devices[1]:
+        raise ValueError(
+            "cameras.wrist_left.device 与 wrist_right.device 不能相同"
+        )
     if int(cfg["robot"]["hand_dof"]) != 7:
         raise ValueError("robot.hand_dof 必须为 7")
     if len(cfg["robot"]["hand_min"]) != 7 or len(cfg["robot"]["hand_max"]) != 7:
