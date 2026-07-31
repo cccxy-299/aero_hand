@@ -53,6 +53,8 @@ robot:
     hand_port: "/dev/ttyACM1"
     enable_timeout_s: 5
     health_timeout_s: 3
+    # move_p 无同步返回值，每秒读取一次控制器状态判断无解/越限/刹车等错误。
+    arm_status_poll_interval_s: 1
     # 请在真机标定并确认无碰撞后填写6维末端位姿 [x,y,z,rx,ry,rz]。
     # 未配置 home_pose 时，home 命令会安全拒绝，不会执行运动。
     home_pose: [0, 0.45, -0.45, 0,0,0]
@@ -76,6 +78,7 @@ robot:
     hand_port: "/dev/ttyACM0"
     enable_timeout_s: 5
     health_timeout_s: 3
+    arm_status_poll_interval_s: 1
     # 右臂 home_pose 必须单独标定，不能照抄左臂；尤其要检查双臂回零轨迹。
     home_pose: [0, 0.45, -0.45, 0,0,0]
     home_speed_percent: 10

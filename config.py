@@ -113,6 +113,7 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         for name, default in (
             ("enable_timeout_s", 5),
             ("health_timeout_s", 3),
+            ("arm_status_poll_interval_s", 1),
             ("home_timeout_s", 10),
             ("home_position_tolerance_m", 0.02),
             ("home_orientation_tolerance_rad", 0.15),

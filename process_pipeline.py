@@ -496,6 +496,7 @@ def _control_process(
                     "metrics",
                     metrics=dict(metrics),
                     active=True,
+                    hardware=robot.status_snapshot(),
                 )
                 last_report_ns = now_ns
             deadline_ns += period_ns

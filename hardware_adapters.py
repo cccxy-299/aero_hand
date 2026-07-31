@@ -31,9 +31,15 @@ class LatestCommandWorker:
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.last_error: str | None = None
         self.dropped = 0
+        self.submitted = 0
+        self.completed = 0
+        self.failed = 0
+        self.last_duration_ms = 0.0
+        self.max_duration_ms = 0.0
         self.thread.start()
 
     def submit(self, value: np.ndarray) -> None:
+        self.submitted += 1
         try:
             self.queue.put_nowait(value.copy())
         except queue.Full:
@@ -49,12 +55,31 @@ class LatestCommandWorker:
             value = self.queue.get()
             if value is None:
                 return
+            started_ns = time.perf_counter_ns()
             try:
                 self.callback(value)
                 self.last_error = None
+                self.completed += 1
             except Exception as exc:  # 硬件异常留在工作线程并进入诊断
                 self.last_error = repr(exc)
+                self.failed += 1
                 LOG.exception("%s 下发失败", self.name)
+            finally:
+                duration_ms = (time.perf_counter_ns() - started_ns) / 1e6
+                self.last_duration_ms = duration_ms
+                self.max_duration_ms = max(self.max_duration_ms, duration_ms)
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "submitted": self.submitted,
+            "completed": self.completed,
+            "failed": self.failed,
+            "dropped": self.dropped,
+            "last_duration_ms": round(self.last_duration_ms, 3),
+            "max_duration_ms": round(self.max_duration_ms, 3),
+            "last_error": self.last_error,
+            "alive": self.thread.is_alive(),
+        }
 
     def close(self, timeout_s: float = 3.0) -> bool:
         """丢弃未执行命令并等待工作线程退出。
@@ -83,6 +108,24 @@ class DualPiperAerohand:
         self.arm_locks = {side: threading.Lock() for side in ("left", "right")}
         self.workers: dict[str, LatestCommandWorker] = {}
         self.last_hand = {side: np.zeros(7, np.float32) for side in ("left", "right")}
+        self.last_arm_pose: dict[str, np.ndarray | None] = {
+            side: None for side in ("left", "right")
+        }
+        self.last_arm_target: dict[str, np.ndarray | None] = {
+            side: None for side in ("left", "right")
+        }
+        self.first_arm_target: dict[str, np.ndarray | None] = {
+            side: None for side in ("left", "right")
+        }
+        self.arm_diagnostics: dict[str, dict[str, Any]] = {
+            side: {
+                "move_p_calls": 0,
+                "last_move_p_ms": 0.0,
+                "max_move_p_ms": 0.0,
+                "last_status_poll_ns": 0,
+            }
+            for side in ("left", "right")
+        }
         self.last_command: BimanualControlCommand | None = None
         self.state = "new"
         self.homed = False
@@ -97,6 +140,33 @@ class DualPiperAerohand:
         return self.state == "active"
 
     def status_snapshot(self) -> dict[str, Any]:
+        arm_status: dict[str, Any] = {}
+        for side in ("left", "right"):
+            target = self.last_arm_target[side]
+            first_target = self.first_arm_target[side]
+            actual = self.last_arm_pose[side]
+            diagnostics = {
+                key: value
+                for key, value in self.arm_diagnostics[side].items()
+                if key != "last_status_poll_ns"
+            }
+            diagnostics["target"] = (
+                target.tolist() if target is not None else None
+            )
+            diagnostics["actual"] = (
+                actual.tolist() if actual is not None else None
+            )
+            diagnostics["target_delta_from_first_m"] = (
+                round(float(np.linalg.norm(target[:3] - first_target[:3])), 6)
+                if target is not None and first_target is not None
+                else None
+            )
+            diagnostics["tracking_error_m"] = (
+                round(float(np.linalg.norm(target[:3] - actual[:3])), 6)
+                if target is not None and actual is not None
+                else None
+            )
+            arm_status[side] = diagnostics
         return {
             "state": self.state,
             "initialized": self.initialized,
@@ -104,12 +174,21 @@ class DualPiperAerohand:
             "homed": self.homed,
             "connected_arms": sorted(self.arms),
             "connected_hands": sorted(self.hands),
-            "worker_errors": {
-                name: worker.last_error
+            "arms": arm_status,
+            "workers": {
+                name: worker.status_snapshot()
                 for name, worker in self.workers.items()
-                if worker.last_error is not None
             },
         }
+
+    @staticmethod
+    def _status_value(value: Any) -> int | str | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
 
     @staticmethod
     def _message_array(value: Any, expected_shape: tuple[int, ...]) -> np.ndarray:
@@ -382,6 +461,14 @@ class DualPiperAerohand:
                     self.arms[side].set_speed_percent(
                         int(self.cfg[side].get("speed_percent", 20))
                     )
+                    self.last_arm_target[side] = None
+                    self.first_arm_target[side] = None
+                    self.arm_diagnostics[side] = {
+                        "move_p_calls": 0,
+                        "last_move_p_ms": 0.0,
+                        "max_move_p_ms": 0.0,
+                        "last_status_poll_ns": 0,
+                    }
 
                 for side in ("left", "right"):
                     self.workers[f"arm_{side}"] = LatestCommandWorker(
@@ -403,11 +490,79 @@ class DualPiperAerohand:
                 raise
 
     def _send_arm(self, side: str, value: np.ndarray) -> None:
+        target = np.asarray(value, dtype=np.float32)
+        if target.shape != (6,) or not np.all(np.isfinite(target)):
+            raise ValueError(
+                f"{side} Piper move_p 目标必须是有效6维末端位姿，实际 {target.shape}"
+            )
+
         with self.arm_locks[side]:
-            # TODO: 打印并未执行
-            # pass
-            # print(f"动作执行，hardware_adapter, _send_arm() side: {side}, value: {value}")
-            self.arms[side].move_p(value.tolist())
+            started_ns = time.perf_counter_ns()
+            self.arms[side].move_p(target.tolist())
+            duration_ms = (time.perf_counter_ns() - started_ns) / 1e6
+
+            diagnostics = self.arm_diagnostics[side]
+            diagnostics["move_p_calls"] += 1
+            diagnostics["last_move_p_ms"] = round(duration_ms, 3)
+            diagnostics["max_move_p_ms"] = round(
+                max(float(diagnostics["max_move_p_ms"]), duration_ms), 3
+            )
+            self.last_arm_target[side] = target.copy()
+            if self.first_arm_target[side] is None:
+                self.first_arm_target[side] = target.copy()
+
+            # move_p() 只负责发送 CAN 帧，不返回控制器是否接受目标。低频读取
+            # arm_status 才能发现无解、奇异点、目标越限、刹车未释放等异步错误。
+            now_ns = time.perf_counter_ns()
+            poll_interval_ns = int(
+                float(self.cfg[side].get("arm_status_poll_interval_s", 1.0))
+                * 1e9
+            )
+            if (
+                now_ns - int(diagnostics["last_status_poll_ns"])
+                >= poll_interval_ns
+            ):
+                status = self.arms[side].get_arm_status()
+                if status is None:
+                    raise RuntimeError(f"{side} Piper 未返回 arm_status")
+                message = getattr(status, "msg", status)
+                for name in (
+                    "ctrl_mode",
+                    "arm_status",
+                    "mode_feedback",
+                    "motion_status",
+                    "err_status",
+                ):
+                    diagnostics[name] = self._status_value(
+                        getattr(message, name, None)
+                    )
+                if hasattr(self.arms[side], "get_joints_enable_status_list"):
+                    enabled_feedback = self.arms[
+                        side
+                    ].get_joints_enable_status_list()
+                    if enabled_feedback is None:
+                        raise RuntimeError(
+                            f"{side} Piper 未返回关节使能状态"
+                        )
+                    enabled = [
+                        bool(item)
+                        for item in enabled_feedback
+                    ]
+                    diagnostics["joints_enabled"] = enabled
+                    if enabled and not all(enabled):
+                        raise RuntimeError(
+                            f"{side} Piper 关节未全部使能: {enabled}"
+                        )
+                diagnostics["last_status_poll_ns"] = now_ns
+                arm_status = diagnostics.get("arm_status")
+                if isinstance(arm_status, int) and arm_status != 0:
+                    raise RuntimeError(
+                        f"{side} Piper 控制器拒绝 move_p: "
+                        f"arm_status={arm_status}, "
+                        f"mode_feedback={diagnostics.get('mode_feedback')}, "
+                        f"err_status={diagnostics.get('err_status')}, "
+                        f"target={target.tolist()}"
+                    )
 
     def _send_hand(self, side: str, value: np.ndarray) -> None:
         if value.shape != (7,):
@@ -444,6 +599,7 @@ class DualPiperAerohand:
         for side in ("left", "right"):
             with self.arm_locks[side]:
                 flange, joints = self._read_arm_feedback(side)
+                self.last_arm_pose[side] = flange.copy()
 
             states[side] = RobotState(flange, joints, self.last_hand[side].copy())
         return BimanualRobotState(states["left"], states["right"])
