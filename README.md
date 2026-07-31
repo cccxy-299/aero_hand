@@ -203,6 +203,12 @@ python camera_concurrency_test.py --mode sweep-left --sweep-duration-s 10
 python camera_concurrency_test.py --mode sweep-right --sweep-duration-s 10
 ```
 
+默认启用 `--prestart-drain`：两路 `VxStartStreaming()` 后、统一计时开始前也会持续
+调用 `VxGetImage()`，避免 SDK/UVC 启动缓冲池因同步等待而塞满。可用
+`--no-prestart-drain` 复现旧测试时序并进行 A/B 对比，但不要用该模式判断正式采集
+架构是否稳定。日志中的 `warmup_frames`、`warmup_errors` 只用于诊断，不计入正式
+`source_fps` 和 `error_ratio`。
+
 若已从启动日志确认稳定的格式索引，可显式比较，例如：
 
 ```bash

@@ -27,6 +27,8 @@ camera_serial_to_num: Dict[str, int] = {
 
 # 运行时填充：cam_num -> 设备列表中的物理 index
 camera_num_to_index: Dict[int, int] = {}
+# 厂商 SDK 的设备发现以及全局映射更新不应由多个线程同时执行。
+_camera_discovery_lock = threading.Lock()
 
 
 # ============================================================
@@ -203,6 +205,8 @@ class CameraInterface:
 
         self.camera = None
         self.format = None
+        # 记录的是过滤后的 MJPG 列表索引，便于真机日志固定并复现实测格式。
+        self.selected_format_idx: Optional[int] = None
         self.index = None
 
         self._frame_bgr: Optional[np.ndarray] = None
@@ -223,8 +227,14 @@ class CameraInterface:
 
         # 如果还没有检测过设备，则自动检测一次
         if self.cam_num not in camera_num_to_index:
-            self.logger.info("camera_num_to_index is empty or missing current camera, detecting cameras...")
-            detect_connected_cameras()
+            with _camera_discovery_lock:
+                # 获取锁后再次检查，避免另一相机线程已经完成了全量发现。
+                if self.cam_num not in camera_num_to_index:
+                    self.logger.info(
+                        "camera_num_to_index is empty or missing current "
+                        "camera, detecting cameras..."
+                    )
+                    detect_connected_cameras()
 
         if self.cam_num not in camera_num_to_index:
             raise RuntimeError(
@@ -289,6 +299,7 @@ class CameraInterface:
 
         self.camera = None
         self.format = None
+        self.selected_format_idx = None
         self._thread = None
         with self._lock:
             self._frame_bgr = None
@@ -382,6 +393,7 @@ class CameraInterface:
             if not _sdk_call_succeeded(result):
                 raise RuntimeError(f"VxStartStreaming 失败: result={result!r}")
             streaming = True
+            self.selected_format_idx = selected_idx
             return camera, fmt
         except BaseException:
             if streaming:

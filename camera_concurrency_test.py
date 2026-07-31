@@ -47,6 +47,7 @@ def _camera_worker(
     spec: CameraSpec,
     duration_s: float,
     progress_s: float,
+    prestart_drain: bool,
     start_event: Any,
     stop_event: Any,
     status_queue: Any,
@@ -65,6 +66,9 @@ def _camera_worker(
     max_read_ms = 0.0
     started_ns = 0
     selected_format: dict[str, Any] | None = None
+    warmup_frames = 0
+    warmup_errors = 0
+    warmup_errors_by_reason: dict[str, int] = {}
 
     logging.basicConfig(
         level=logging.INFO,
@@ -107,18 +111,53 @@ def _camera_worker(
             "height": int(camera.format.height),
             "fps": float(camera.format.framerate),
             "format_idx_requested": spec.format_idx,
+            "format_idx_selected": camera.selected_format_idx,
         }
-        send(
-            "ready",
-            spec=asdict(spec),
-            selected_format=selected_format,
-        )
+        send("opened", spec=asdict(spec), selected_format=selected_format)
 
-        while not stop_event.is_set() and not start_event.wait(0.05):
-            pass
+        if prestart_drain:
+            # VxStartStreaming 后不能停在同步屏障上不取图。部分 UVC/SDK 组合在
+            # 启动缓冲池塞满后不会自行恢复，表现为先返回固定数量帧、随后永久超时。
+            # 因此两相机就绪前持续排空，只把共同 start 之后的帧计入正式指标。
+            ready_reported = False
+            while not stop_event.is_set() and not start_event.is_set():
+                try:
+                    camera.get_rgb_with_timestamp()
+                except Exception as exc:
+                    warmup_errors += 1
+                    reason = _classify_error(exc)
+                    warmup_errors_by_reason[reason] = (
+                        warmup_errors_by_reason.get(reason, 0) + 1
+                    )
+                else:
+                    warmup_frames += 1
+                    if not ready_reported:
+                        send(
+                            "ready",
+                            spec=asdict(spec),
+                            selected_format=selected_format,
+                            warmup_frames=warmup_frames,
+                        )
+                        ready_reported = True
+        else:
+            # 仅用于 A/B 复现旧测试时序，不建议用于稳定性结论。
+            send(
+                "ready",
+                spec=asdict(spec),
+                selected_format=selected_format,
+                warmup_frames=0,
+            )
+            while not stop_event.is_set() and not start_event.wait(0.05):
+                pass
         if stop_event.is_set():
             return
 
+        send(
+            "measurement_started",
+            warmup_frames=warmup_frames,
+            warmup_errors=warmup_errors,
+            warmup_errors_by_reason=dict(warmup_errors_by_reason),
+        )
         started_ns = time.perf_counter_ns()
         finish_ns = started_ns + int(duration_s * 1e9)
         next_progress_ns = started_ns + int(progress_s * 1e9)
@@ -243,6 +282,9 @@ def _camera_worker(
                 3,
             ),
             selected_format=selected_format,
+            warmup_frames=warmup_frames,
+            warmup_errors=warmup_errors,
+            warmup_errors_by_reason=dict(warmup_errors_by_reason),
         )
 
 
@@ -254,6 +296,7 @@ def _run_group(
     progress_s: float,
     stagger_start_ms: float,
     startup_timeout_s: float,
+    prestart_drain: bool,
 ) -> list[dict[str, Any]]:
     if backend == "process":
         context = mp.get_context("spawn")
@@ -268,6 +311,7 @@ def _run_group(
                     spec,
                     duration_s,
                     progress_s,
+                    prestart_drain,
                     start_event,
                     stop_event,
                     status_queue,
@@ -287,6 +331,7 @@ def _run_group(
                     spec,
                     duration_s,
                     progress_s,
+                    prestart_drain,
                     start_event,
                     stop_event,
                     status_queue,
@@ -527,6 +572,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stagger-start-ms", type=float, default=500.0)
     parser.add_argument("--startup-timeout-s", type=float, default=15.0)
     parser.add_argument(
+        "--prestart-drain",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "VxStartStreaming 后在统一计时开始前持续排空 SDK；"
+            "--no-prestart-drain 仅用于复现旧测试的启动停流问题"
+        ),
+    )
+    parser.add_argument(
         "--strict-fps",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -570,6 +624,7 @@ def main() -> None:
             progress_s=args.progress_s,
             stagger_start_ms=0,
             startup_timeout_s=args.startup_timeout_s,
+            prestart_drain=args.prestart_drain,
         )
         _print_verdict(summaries, specs)
     elif args.mode == "single-right":
@@ -581,6 +636,7 @@ def main() -> None:
             progress_s=args.progress_s,
             stagger_start_ms=0,
             startup_timeout_s=args.startup_timeout_s,
+            prestart_drain=args.prestart_drain,
         )
         _print_verdict(summaries, specs)
     elif args.mode == "sequential":
@@ -592,6 +648,7 @@ def main() -> None:
                 progress_s=args.progress_s,
                 stagger_start_ms=0,
                 startup_timeout_s=args.startup_timeout_s,
+                prestart_drain=args.prestart_drain,
             )
             _print_verdict(summaries, [spec])
     elif args.mode in {"dual-thread", "dual-process"}:
@@ -605,6 +662,7 @@ def main() -> None:
             progress_s=args.progress_s,
             stagger_start_ms=args.stagger_start_ms,
             startup_timeout_s=args.startup_timeout_s,
+            prestart_drain=args.prestart_drain,
         )
         _print_verdict(summaries, specs)
     else:
@@ -626,6 +684,7 @@ def main() -> None:
                 progress_s=args.progress_s,
                 stagger_start_ms=0,
                 startup_timeout_s=args.startup_timeout_s,
+                prestart_drain=args.prestart_drain,
             )
             _print_verdict(summaries, [spec])
 
