@@ -84,14 +84,17 @@ quit
 - `status`：输出当前状态、帧数和已有 episode 数。
 - `quit`：保存正在录制的 episode（由 `save_on_shutdown` 控制）并退出。
 
-真机默认要求先成功执行一次显式 `home`，否则 `start` 会被拒绝。左右
-`robot.<side>.home_pose` 必须由操作者按真实安装位置标定为
-`[x,y,z,rx,ry,rz]`；未配置时 `home` 会安全拒绝，绝不会用 `initial_pose` 猜测回零
-目标。
+左右 `robot.<side>.home_pose` 必须由操作者按真实安装位置标定为6维关节角。
+收到 `start` 后，系统先以 `home_speed_percent` 依次执行右臂、左臂
+`move_j(home_pose)`，并使用真实关节反馈校验到位；任一侧失败都会 disable 双臂并
+拒绝启动。两侧完成后保持 enable，再启动三路相机，所以回 home 的轨迹不会写进
+episode，也不会在遥操作开始前重复 disable/enable。相机启动期间若收到
+`stop`/`discard` 或启动失败，系统会立即 disable 双臂。
 
-`start` 会先启动并确认三路独立相机进程，再对常驻硬件做健康检查、enable 双 Piper，
-并启动状态、控制和组帧循环。每个 episode 都以机械臂的真实当前位置重新建立 VIVE
-参考点和安全限速历史。`stop`/`discard` 会立即停止命令工作线程并 disable 双臂，
+相机全部就绪后，系统在保持 enable 的状态下再次检查硬件，并直接启动状态、控制和
+组帧循环。每个 episode 都以此时读取的真实法兰位姿重新建立 VIVE 参考点和安全
+限速历史，而不是直接把关节 `home_pose` 当作笛卡尔控制目标。`stop`/`discard`
+会立即停止命令工作线程并 disable 双臂，
 灵巧手保持最后位置；相机随之关闭。CAN/串口和硬件 SDK 实例只在 `robot_main`
 退出时最终释放。下一次 `start` 复用硬件会话，但不会复用旧 episode 的命令、图像、
 state、action 或 VIVE 参考。

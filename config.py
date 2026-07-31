@@ -91,40 +91,12 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
             home_values = [float(value) for value in home_pose]
             if not all(math.isfinite(value) for value in home_values):
                 raise ValueError(f"robot.{side}.home_pose 必须全部为有限值")
-            home_xyz = home_values[:3]
-            # if any(
-            #     value < lower or value > upper
-            #     for value, lower, upper in zip(
-            #         home_xyz, workspace_min, workspace_max
-            #     )
-            # ):
-            #     raise ValueError(
-            #         f"robot.{side}.home_pose 前三维必须位于配置工作空间内"
-            #     )
-            orientation_tolerance = float(
-                side_cfg.get("home_orientation_tolerance_rad", 0.15)
-            )
-            fixed_orientation = [
-                float(value) for value in side_cfg["fixed_orientation"]
-            ]
-            orientation_error = max(
-                abs(math.atan2(math.sin(actual - target), math.cos(actual - target)))
-                for actual, target in zip(
-                    home_values[3:], fixed_orientation
-                )
-            )
-            # if orientation_error > orientation_tolerance:
-            #     raise ValueError(
-            #         f"robot.{side}.home_pose 姿态必须与 fixed_orientation 一致，"
-            #         "否则 start 后第一条遥操作指令可能造成姿态跳变"
-            #     )
         for name, default in (
             ("enable_timeout_s", 5),
             ("health_timeout_s", 3),
             ("arm_status_poll_interval_s", 1),
             ("home_timeout_s", 10),
-            ("home_position_tolerance_m", 0.02),
-            ("home_orientation_tolerance_rad", 0.15),
+            ("home_joint_tolerance_rad", 0.10),
         ):
             if float(side_cfg.get(name, default)) <= 0:
                 raise ValueError(f"robot.{side}.{name} must be positive")

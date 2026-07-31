@@ -215,6 +215,23 @@ def _control_process(
     def deactivate(reason: str) -> None:
         nonlocal robot, retargeter, safety, active, state_thread, state_stop
         if not active:
+            hardware_state = (
+                robot.status_snapshot().get("state")
+                if robot is not None
+                else None
+            )
+            if robot is not None and hardware_state == "prepared_enabled":
+                # start 准备完成后双臂会保持 enable。若用户在相机启动期间
+                # stop/discard，必须立即撤销准备并 disable，不能因 active=False
+                # 而提前返回。
+                robot.deactivate()
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_start_cancelled",
+                    reason=reason,
+                    hardware=robot.status_snapshot(),
+                )
             teleop_buffer.clear()
             return
         # 先关闭控制入口，再停止状态读取和硬件工作线程。
@@ -364,6 +381,48 @@ def _control_process(
         kind = str(command.get("kind", "")).lower()
         if kind == "start":
             activate()
+        elif kind == "prepare_start":
+            if active:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="prepare_start",
+                    reason="episode_active",
+                )
+                return
+            if robot is None:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="prepare_start",
+                    reason="hardware_not_initialized",
+                )
+                return
+            _status_put(
+                status_queue,
+                "control",
+                "control_start_preparing",
+                hardware=robot.status_snapshot(),
+            )
+            try:
+                robot.prepare_start()
+            except BaseException as exc:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_start_prepare_failed",
+                    error=repr(exc),
+                    hardware=robot.status_snapshot(),
+                )
+                return
+            _status_put(
+                status_queue,
+                "control",
+                "control_start_prepared",
+                hardware=robot.status_snapshot(),
+            )
         elif kind == "home":
             if active:
                 _status_put(
@@ -406,7 +465,7 @@ def _control_process(
                 "control_home_completed",
                 hardware=robot.status_snapshot(),
             )
-        elif kind in {"stop", "discard"}:
+        elif kind in {"stop", "discard", "cancel_prepare"}:
             deactivate(kind)
         elif kind == "status":
             _status_put(
@@ -1769,17 +1828,35 @@ def run_robot_multiprocess(
     errors: list[dict[str, Any]] = []
     desired_active = bool(episode_cfg.get("auto_start", False))
     home_in_progress = False
+    start_prepare_in_progress = False
+    pending_start_task: str | None = None
 
     def request_stop(*_: Any) -> None:
         stop_event.set()
 
     def submit_episode_command(kind: str, task: str | None = None) -> None:
-        nonlocal desired_active
+        nonlocal desired_active, start_prepare_in_progress
+        nonlocal pending_start_task
         if kind == "start" and home_in_progress:
             LOG.warning("home 尚未完成，拒绝 start")
             return
         if kind == "start":
+            if start_prepare_in_progress or desired_active:
+                LOG.warning("start 正在准备或 episode 已在运行，拒绝重复 start")
+                return
             desired_active = True
+            start_prepare_in_progress = True
+            pending_start_task = task
+            try:
+                # 先让双臂回到已标定 home_pose。只有准备成功后才启动相机，
+                # 因此 move_j 轨迹不会进入本 episode 的训练数据。
+                control_queue.put_nowait({"kind": "prepare_start"})
+            except queue.Full:
+                desired_active = False
+                start_prepare_in_progress = False
+                pending_start_task = None
+                LOG.error("control 命令队列已满，start 准备命令被拒绝")
+            return
         elif kind in {"stop", "discard"}:
             desired_active = False
         try:
@@ -1883,8 +1960,57 @@ def run_robot_multiprocess(
                         and status.get("command") == "start"
                     ):
                         desired_active = False
+                        try:
+                            control_queue.put_nowait(
+                                {"kind": "cancel_prepare"}
+                            )
+                        except queue.Full:
+                            LOG.error(
+                                "episode start 被拒绝，但无法提交双臂 disable"
+                            )
                 elif str(kind).startswith("control_"):
                     LOG.info("CONTROL %s", json.dumps(status, ensure_ascii=False))
+                    if kind == "control_start_prepared":
+                        start_prepare_in_progress = False
+                        if desired_active:
+                            try:
+                                episode_queue.put(
+                                    {
+                                        "kind": "start",
+                                        "task": pending_start_task,
+                                    },
+                                    timeout=2,
+                                )
+                            except queue.Full:
+                                desired_active = False
+                                LOG.error(
+                                    "机械臂已回 home，但 episode 命令队列已满"
+                                )
+                                try:
+                                    control_queue.put_nowait(
+                                        {"kind": "cancel_prepare"}
+                                    )
+                                except queue.Full:
+                                    LOG.error(
+                                        "无法提交双臂 prepared 状态取消命令"
+                                    )
+                        else:
+                            try:
+                                control_queue.put_nowait(
+                                    {"kind": "cancel_prepare"}
+                                )
+                            except queue.Full:
+                                LOG.error(
+                                    "start 已取消，但无法提交双臂 disable"
+                                )
+                        pending_start_task = None
+                    elif kind == "control_start_prepare_failed" or (
+                        kind == "control_rejected"
+                        and status.get("command") == "prepare_start"
+                    ):
+                        start_prepare_in_progress = False
+                        desired_active = False
+                        pending_start_task = None
                     if kind in {
                         "control_home_completed",
                         "control_home_failed",

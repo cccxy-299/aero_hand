@@ -129,6 +129,9 @@ class DualPiperAerohand:
         self.last_command: BimanualControlCommand | None = None
         self.state = "new"
         self.homed = False
+        self.start_home_count = 0
+        self.last_start_home: dict[str, dict[str, Any]] = {}
+        self.start_prepared = False
         self._lifecycle_lock = threading.RLock()
 
     @property
@@ -172,6 +175,9 @@ class DualPiperAerohand:
             "initialized": self.initialized,
             "active": self.active,
             "homed": self.homed,
+            "start_prepared": self.start_prepared,
+            "start_home_count": self.start_home_count,
+            "last_start_home": dict(self.last_start_home),
             "connected_arms": sorted(self.arms),
             "connected_hands": sorted(self.hands),
             "arms": arm_status,
@@ -311,13 +317,7 @@ class DualPiperAerohand:
             )
         pose = np.asarray(side_cfg["home_pose"], dtype=np.float32)
         if pose.shape != (6,) or not np.all(np.isfinite(pose)):
-            raise RuntimeError(f"robot.{side}.home_pose 必须是有效的6维末端位姿")
-        # lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
-        # upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
-        # if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
-        #     raise RuntimeError(
-        #         f"robot.{side}.home_pose 位置 {pose[:3].tolist()} 超出工作空间"
-        #     )
+            raise RuntimeError(f"robot.{side}.home_pose 必须是有效的6维关节角")
         return pose
 
     def _validated_zero_pose(self, side: str) -> np.ndarray:
@@ -328,13 +328,7 @@ class DualPiperAerohand:
             )
         pose = np.asarray(side_cfg["initial_pose"], dtype=np.float32)
         if pose.shape != (6,) or not np.all(np.isfinite(pose)):
-            raise RuntimeError(f"robot.{side}.initial_pose 必须是有效的6维末端位姿")
-        # lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
-        # upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
-        # if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
-        #     raise RuntimeError(
-        #         f"robot.{side}.initial_pose 位置 {pose[:3].tolist()} 超出工作空间"
-        #     )
+            raise RuntimeError(f"robot.{side}.initial_pose 必须是有效的6维关节角")
         return pose
 
     def _enable_arm(self, side: str) -> None:
@@ -349,38 +343,39 @@ class DualPiperAerohand:
     def _wait_motion_done(
         self, side: str, target: np.ndarray, timeout_s: float
     ) -> None:
-        # move_p 通常异步返回，先留出启动运动状态更新的时间。
+        """等待 move_j 完成，并用真实关节反馈校验是否到达目标。"""
         time.sleep(0.3)
         deadline = time.monotonic() + timeout_s
+        tolerance = float(
+            self.cfg[side].get("home_joint_tolerance_rad", 0.10)
+        )
+        last_motion_status: Any = None
+        last_joint_error = float("inf")
+        last_joints: np.ndarray | None = None
         while time.monotonic() < deadline:
             status = self.arms[side].get_arm_status()
-            motion_status = getattr(getattr(status, "msg", None), "motion_status", None)
-            if motion_status == 0:
-                break
+            last_motion_status = getattr(
+                getattr(status, "msg", status), "motion_status", None
+            )
+            flange, joints = self._read_arm_feedback(side)
+            self.last_arm_pose[side] = flange.copy()
+            last_joints = joints
+            joint_delta = joints - target
+            wrapped_delta = np.arctan2(
+                np.sin(joint_delta), np.cos(joint_delta)
+            )
+            last_joint_error = float(np.max(np.abs(wrapped_delta)))
+            if last_motion_status == 0 and last_joint_error <= tolerance:
+                return
             time.sleep(0.05)
-        else:
-            raise RuntimeError(f"{side} Piper 回零运动超过 {timeout_s:.1f}s")
-
-        # actual, _ = self._read_arm_feedback(side)
-        # position_error = float(np.linalg.norm(actual[:3] - target[:3]))
-        # angle_delta = actual[3:] - target[3:]
-        # angle_error = float(
-        #     np.max(np.abs(np.arctan2(np.sin(angle_delta), np.cos(angle_delta))))
-        # )
-        # position_tolerance = float(
-        #     self.cfg[side].get("home_position_tolerance_m", 0.02)
-        # )
-        # orientation_tolerance = float(
-        #     self.cfg[side].get("home_orientation_tolerance_rad", 0.15)
-        # )
-        # if (
-        #     position_error > position_tolerance
-        #     or angle_error > orientation_tolerance
-        # ):
-        #     raise RuntimeError(
-        #         f"{side} Piper 回零校验失败: position_error={position_error:.4f}m, "
-        #         f"orientation_error={angle_error:.4f}rad"
-        #     )
+        raise RuntimeError(
+            f"{side} Piper move_j 在 {timeout_s:.1f}s 内未到达 home_pose；"
+            f"motion_status={last_motion_status}, "
+            f"max_joint_error={last_joint_error:.4f}rad, "
+            f"tolerance={tolerance:.4f}rad, "
+            f"target={target.tolist()}, "
+            f"actual={last_joints.tolist() if last_joints is not None else None}"
+        )
 
     def home(self) -> None:
         """显式执行双侧回零；运动完成并校验后再次 disable 双臂。"""
@@ -442,22 +437,93 @@ class DualPiperAerohand:
                 self.state = "fault"
                 raise
 
-    def activate(self) -> None:
-        """episode start：健康检查、双臂使能并启动非阻塞命令工作线程。"""
+    def prepare_start(self) -> None:
+        """start 前依次将双臂移动到已标定的关节 home_pose。
+
+        该阶段不启动遥操作命令线程。每侧到位后保持 enable，全部完成后才允许
+        相机和 episode 继续启动，因此回 home 的运动不会写入训练数据，也不会
+        在正式遥操作前发生一次多余的 disable/enable。
+        """
         with self._lifecycle_lock:
             if self.state != "idle_disabled":
+                raise RuntimeError(
+                    f"当前状态 {self.state} 不允许 prepare_start"
+                )
+
+            # 必须在任何机械臂运动前一次性校验左右目标，避免只移动一侧。
+            targets = {
+                side: self._validated_home_pose(side)
+                for side in ("left", "right")
+            }
+            self.state = "preparing_start"
+            self.start_prepared = False
+            self.last_start_home = {}
+            try:
+                # 沿用现有真机验证顺序，双臂绝不同时执行回 home 轨迹。
+                for side in ("right", "left"):
+                    arm = self.arms[side]
+                    self._enable_arm(side)
+                    speed = int(
+                        self.cfg[side].get("home_speed_percent", 10)
+                    )
+                    timeout_s = float(
+                        self.cfg[side].get("home_timeout_s", 10.0)
+                    )
+                    arm.set_speed_percent(speed)
+                    LOG.info(
+                        "%s Piper start 前移动到 home_pose: %s",
+                        side,
+                        targets[side].tolist(),
+                    )
+                    started_ns = time.perf_counter_ns()
+                    arm.move_j(targets[side].tolist())
+                    self._wait_motion_done(
+                        side, targets[side], timeout_s
+                    )
+                    _, actual_joints = self._read_arm_feedback(side)
+                    elapsed_s = (
+                        time.perf_counter_ns() - started_ns
+                    ) / 1e9
+                    self.last_start_home[side] = {
+                        "target_joints": targets[side].tolist(),
+                        "actual_joints": actual_joints.tolist(),
+                        "elapsed_s": round(elapsed_s, 3),
+                        "speed_percent": speed,
+                    }
+                    LOG.info(
+                        "%s Piper 已到达 start home_pose，保持 enable", side
+                    )
+
+                self.homed = True
+                self.start_home_count += 1
+                self.start_prepared = True
+                self.state = "prepared_enabled"
+            except BaseException:
+                self.homed = False
+                self.start_prepared = False
+                self._disable_all_arms()
+                self.state = "fault"
+                raise
+
+    def activate(self) -> None:
+        """从保持使能的 home_pose 直接启动非阻塞遥操作命令线程。"""
+        with self._lifecycle_lock:
+            if self.state != "prepared_enabled":
                 raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
+            if not self.start_prepared:
+                raise RuntimeError(
+                    "本次 start 尚未完成双臂 home_pose 准备，拒绝 activate"
+                )
             # if bool(self.cfg.get("require_home_before_start", True)) and not self.homed:
             #     raise RuntimeError("尚未成功执行显式 home，拒绝 start")
 
             for side in ("left", "right"):
                 self._wait_for_feedback(side)
 
-            enabled_sides: list[str] = []
             try:
                 for side in ("left", "right"):
-                    self._enable_arm(side)
-                    enabled_sides.append(side)
+                    # prepare_start 已保持 enable；这里只切换为遥操作速度，
+                    # 不再执行 disable/enable。
                     self.arms[side].set_speed_percent(
                         int(self.cfg[side].get("speed_percent", 20))
                     )
@@ -482,12 +548,11 @@ class DualPiperAerohand:
                         lambda value, s=side: self._send_hand(s, value),
                     )
                 self.state = "active"
+                # 准备状态只允许消费一次；下一个 episode 必须重新回 home_pose。
+                self.start_prepared = False
             except BaseException:
-                for side in enabled_sides:
-                    try:
-                        self.arms[side].disable()
-                    except Exception:
-                        LOG.exception("%s Piper 使能失败后的回滚 disable 失败", side)
+                self.start_prepared = False
+                self._disable_all_arms()
                 self.state = "fault"
                 raise
 
@@ -621,6 +686,7 @@ class DualPiperAerohand:
                     stuck_workers.append(name)
             self.workers.clear()
             self._disable_all_arms()
+            self.start_prepared = False
             self.last_command = None
             if stuck_workers:
                 self.state = "fault"

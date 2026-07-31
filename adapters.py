@@ -23,6 +23,7 @@ class OperatorSource(Protocol):
 class RobotIO(Protocol):
     def initialize(self) -> None: ...
     def home(self) -> None: ...
+    def prepare_start(self) -> None: ...
     def activate(self) -> None: ...
     def command(self, value: BimanualControlCommand) -> None: ...
     def read_state(self) -> BimanualRobotState: ...
@@ -107,8 +108,15 @@ class SimRobot:
             raise RuntimeError(f"当前状态 {self.state} 不允许 home")
         self.homed = True
 
-    def activate(self) -> None:
+    def prepare_start(self) -> None:
+        """仿真模式模拟 start 前回到已知机械臂起始姿态。"""
         if self.state != "idle_disabled":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 prepare_start")
+        self.homed = True
+        self.state = "prepared_enabled"
+
+    def activate(self) -> None:
+        if self.state not in {"idle_disabled", "prepared_enabled"}:
             raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
         self.state = "active"
 
@@ -128,7 +136,7 @@ class SimRobot:
         )
 
     def deactivate(self) -> None:
-        if self.state == "active":
+        if self.state in {"active", "prepared_enabled"}:
             self.state = "idle_disabled"
 
     def close(self) -> None:
