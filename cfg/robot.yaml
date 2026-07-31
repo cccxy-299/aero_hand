@@ -65,6 +65,9 @@ robot:
     hand_home_wait_s: 8
     vive_scale: 0.3
     initial_pose: [0, 0, 0, 0,0,0]
+    # start 时锁定真实法兰姿态，episode 内仅由 VIVE 控制位置，避免首帧姿态跳变。
+    orientation_mode: "current_on_start"
+    # 仅当 orientation_mode=configured_fixed 时使用。
     fixed_orientation: [0.0698, 1.3963,0]
     workspace_min: [0.05, 0.00, 0.05]
     workspace_max: [0.40, 0.35, 0.45]
@@ -88,6 +91,8 @@ robot:
     hand_home_wait_s: 8
     vive_scale: 0.3
     initial_pose: [0, 0, 0, 0,0,0]
+    orientation_mode: "current_on_start"
+    # 仅当 orientation_mode=configured_fixed 时使用。
     fixed_orientation: [-1.3963,1.5184,-1.3614]
     workspace_min: [0.05, -0.35, 0.05]
     workspace_max: [0.40, 0.00, 0.45]

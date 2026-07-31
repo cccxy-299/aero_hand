@@ -467,7 +467,9 @@ class DualPiperAerohand:
                         "move_p_calls": 0,
                         "last_move_p_ms": 0.0,
                         "max_move_p_ms": 0.0,
-                        "last_status_poll_ns": 0,
+                        # 不在第一条 move_p 后立即读取，避免拿到上一会话残留状态；
+                        # 首次诊断在配置的轮询周期后进行。
+                        "last_status_poll_ns": time.perf_counter_ns(),
                     }
 
                 for side in ("left", "right"):

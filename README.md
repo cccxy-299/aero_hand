@@ -171,7 +171,10 @@ Queue IPC 只传递遥操作、机器人状态和最终动作。队列溢出时�
 TCP 和左右工作空间标定。
 
 设备 A 启动时强制加载 `manus.calibration_file` 中该操作者的左右拇指 CMC 标定；
-缺失或不完整时拒绝启动。VIVE 当前默认只跟随位置并使用固定末端姿态。
+缺失或不完整时拒绝启动。VIVE 默认只跟随位置；每个 episode 在 `start` 时读取并
+锁定左右机械臂各自的真实法兰姿态（`orientation_mode: current_on_start`），首帧
+不会跳转到配置中的另一套姿态。只有经过可达性验证后，才应显式改为
+`orientation_mode: configured_fixed` 并使用 `fixed_orientation`。
 
 ## LeRobot 双侧字段
 

@@ -72,6 +72,14 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
                 raise ValueError(f"robot.{side}.{name} 必须包含 3 个值")
             if not all(math.isfinite(float(item)) for item in value):
                 raise ValueError(f"robot.{side}.{name} 必须全部为有限值")
+        orientation_mode = str(
+            side_cfg.get("orientation_mode", "current_on_start")
+        ).lower()
+        if orientation_mode not in {"current_on_start", "configured_fixed"}:
+            raise ValueError(
+                f"robot.{side}.orientation_mode 必须为 "
+                "current_on_start 或 configured_fixed"
+            )
         workspace_min = [float(value) for value in side_cfg["workspace_min"]]
         workspace_max = [float(value) for value in side_cfg["workspace_max"]]
         if any(lower >= upper for lower, upper in zip(workspace_min, workspace_max)):

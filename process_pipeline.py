@@ -134,12 +134,37 @@ def _make_episode_control_components(
 ) -> tuple[Any, dict[str, SafetyGate]]:
     initial_poses = _episode_initial_poses(cfg, robot_state)
     if bool(cfg["robot"]["enabled"]):
+        orientations: dict[str, np.ndarray] = {}
+        for side in SIDES:
+            side_cfg = cfg["robot"][side]
+            orientation_mode = str(
+                side_cfg.get("orientation_mode", "current_on_start")
+            ).lower()
+            if orientation_mode == "current_on_start":
+                # 最安全的3DoF遥操作方式：锁定 start 时的真实法兰姿态。
+                # 因此首个 VIVE 包只建立位置零点，不会触发姿态跳变。
+                orientations[side] = initial_poses[side][3:].copy()
+            elif orientation_mode == "configured_fixed":
+                orientations[side] = np.asarray(
+                    side_cfg["fixed_orientation"], dtype=np.float32
+                )
+            else:
+                raise ValueError(
+                    f"robot.{side}.orientation_mode 非法: {orientation_mode}"
+                )
+            LOG.info(
+                "%s episode 姿态策略=%s，固定姿态=%s",
+                side,
+                orientation_mode,
+                orientations[side].tolist(),
+            )
+
         retargeter = HardwareBimanualRetargeter(
             {
                 side: SideRetargetConfig(
                     initial_poses[side],
                     float(cfg["robot"][side].get("vive_scale", 0.6)),
-                    np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
+                    orientations[side],
                 )
                 for side in SIDES
             }

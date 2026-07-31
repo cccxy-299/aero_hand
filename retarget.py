@@ -35,7 +35,11 @@ class SideRetargetConfig:
 
 
 class HardwareBimanualRetargeter:
-    """设备 B 只映射 VIVE；7维灵巧手指令由设备 A 直接提供。"""
+    """设备 B 映射 VIVE 位置；7维灵巧手指令由设备 A 直接提供。
+
+    ``fixed_orientation`` 由 episode 创建阶段确定。安全默认值是 start 时读取的
+    真实法兰姿态，因此首帧不会把当前位置与另一套姿态强行组合。
+    """
 
     def __init__(self, sides: dict[str, SideRetargetConfig]) -> None:
         self.sides = sides
