@@ -511,7 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--fourcc", default="MJPG")
     parser.add_argument(
         "--backend", choices=("v4l2", "any"), default="v4l2"

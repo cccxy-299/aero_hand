@@ -7,6 +7,8 @@ import time
 from typing import Any, Callable
 
 import numpy as np
+from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
+from aero_open_sdk.aero_hand import AeroHand
 
 from model import (
     BimanualControlCommand,
@@ -105,10 +107,10 @@ class DualPiperAerohand:
             arm = AgxArmFactory.create_arm(arm_config)
             arm.connect()
             deadline = time.monotonic() + float(side_cfg.get("enable_timeout_s", 5))
-            # while not arm.enable():
-            #     if time.monotonic() >= deadline:
-            #         raise RuntimeError(f"{side} Piper 使能超时")
-            #     time.sleep(0.05)
+            while not arm.enable():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"{side} Piper 使能超时")
+                time.sleep(0.05)
             arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
             self.arms[side] = arm
             hand = AeroHand(port=side_cfg["hand_port"])
