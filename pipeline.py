@@ -73,7 +73,8 @@ class RobotPipeline:
         self.buffers["teleop"].append(sample)
 
     def start(self) -> None:
-        self.robot.connect()
+        self.robot.initialize()
+        self.robot.activate()
         for camera in self.cameras.values():
             camera.connect()
         # 单进程 simulate 入口自动录制一个 episode；真机入口使用显式状态机。
@@ -105,8 +106,8 @@ class RobotPipeline:
         for thread in self.threads:
             if thread.name == "writer":
                 thread.join(timeout=10)
-        self.robot.stop()
-        self.robot.disconnect()
+        self.robot.deactivate()
+        self.robot.close()
         for camera in self.cameras.values():
             camera.disconnect()
 

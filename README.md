@@ -61,11 +61,13 @@ false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐�
 
 ## Episode 人工控制
 
-设备 B 启动完成后处于 `idle`：机器人、CAN/串口和三路相机均未连接，控制循环与
-相机进程也未启动；仅保留父进程、UDP/时钟同步监听和阻塞式命令队列。在
+设备 B 启动时，control 子进程会创建并连接双 Piper/双 Aerohand，完成双侧通信和
+状态检查后立即确保两台机械臂均为 `disable`。CAN/串口会跨 episode 保持连接；
+三路相机仍保持关闭，控制循环也不会启动。在
 `robot_main` 所在终端输入：
 
 ```text
+home
 start
 start Pick up the red block
 stop
@@ -74,16 +76,25 @@ status
 quit
 ```
 
+- `home`：不启动相机和 episode；依次低速回零左右 Piper、回零双 Aerohand，
+  校验成功后再次 disable 双臂。
 - `start [可选任务描述]`：开始一个新 episode。
 - `stop`：停止当前 episode，等待三路视频、Parquet 和元数据保存完成。
 - `discard`：丢弃当前 episode，不增加 episode 编号。
 - `status`：输出当前状态、帧数和已有 episode 数。
 - `quit`：保存正在录制的 episode（由 `save_on_shutdown` 控制）并退出。
 
-`start` 会先启动并确认三路独立相机进程，再连接双 Piper/双 Aerohand 并启动状态、
-控制和组帧循环。`stop`/`discard` 会立即停止机器人控制、关闭相机进程并释放设备；
-`stop` 随后保存 episode，`discard` 则清理临时帧。下一次 `start` 会建立全新的硬件
-会话和时间缓冲，旧 episode 的图像、state 或 action 不会被复用。
+真机默认要求先成功执行一次显式 `home`，否则 `start` 会被拒绝。左右
+`robot.<side>.home_pose` 必须由操作者按真实安装位置标定为
+`[x,y,z,rx,ry,rz]`；未配置时 `home` 会安全拒绝，绝不会用 `initial_pose` 猜测回零
+目标。
+
+`start` 会先启动并确认三路独立相机进程，再对常驻硬件做健康检查、enable 双 Piper，
+并启动状态、控制和组帧循环。每个 episode 都以机械臂的真实当前位置重新建立 VIVE
+参考点和安全限速历史。`stop`/`discard` 会立即停止命令工作线程并 disable 双臂，
+灵巧手保持最后位置；相机随之关闭。CAN/串口和硬件 SDK 实例只在 `robot_main`
+退出时最终释放。下一次 `start` 复用硬件会话，但不会复用旧 episode 的命令、图像、
+state、action 或 VIVE 参考。
 
 保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
 就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。

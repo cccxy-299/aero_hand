@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,77 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for side in ("left", "right"):
         if side not in cfg["robot"]:
             raise ValueError(f"robot.{side} is required for bimanual control")
+        side_cfg = cfg["robot"][side]
+        for name in ("initial_pose",):
+            value = side_cfg.get(name)
+            if not isinstance(value, list) or len(value) != 6:
+                raise ValueError(f"robot.{side}.{name} 必须包含 6 个值")
+            if not all(math.isfinite(float(item)) for item in value):
+                raise ValueError(f"robot.{side}.{name} 必须全部为有限值")
+        for name in ("workspace_min", "workspace_max", "fixed_orientation"):
+            value = side_cfg.get(name)
+            if not isinstance(value, list) or len(value) != 3:
+                raise ValueError(f"robot.{side}.{name} 必须包含 3 个值")
+            if not all(math.isfinite(float(item)) for item in value):
+                raise ValueError(f"robot.{side}.{name} 必须全部为有限值")
+        workspace_min = [float(value) for value in side_cfg["workspace_min"]]
+        workspace_max = [float(value) for value in side_cfg["workspace_max"]]
+        if any(lower >= upper for lower, upper in zip(workspace_min, workspace_max)):
+            raise ValueError(f"robot.{side} 工作空间上下界非法")
+        if "home_pose" in side_cfg:
+            home_pose = side_cfg["home_pose"]
+            if not isinstance(home_pose, list) or len(home_pose) != 6:
+                raise ValueError(f"robot.{side}.home_pose 必须包含 6 个值")
+            home_values = [float(value) for value in home_pose]
+            if not all(math.isfinite(value) for value in home_values):
+                raise ValueError(f"robot.{side}.home_pose 必须全部为有限值")
+            home_xyz = home_values[:3]
+            if any(
+                value < lower or value > upper
+                for value, lower, upper in zip(
+                    home_xyz, workspace_min, workspace_max
+                )
+            ):
+                raise ValueError(
+                    f"robot.{side}.home_pose 前三维必须位于配置工作空间内"
+                )
+            orientation_tolerance = float(
+                side_cfg.get("home_orientation_tolerance_rad", 0.15)
+            )
+            fixed_orientation = [
+                float(value) for value in side_cfg["fixed_orientation"]
+            ]
+            orientation_error = max(
+                abs(math.atan2(math.sin(actual - target), math.cos(actual - target)))
+                for actual, target in zip(
+                    home_values[3:], fixed_orientation
+                )
+            )
+            if orientation_error > orientation_tolerance:
+                raise ValueError(
+                    f"robot.{side}.home_pose 姿态必须与 fixed_orientation 一致，"
+                    "否则 start 后第一条遥操作指令可能造成姿态跳变"
+                )
+        for name, default in (
+            ("enable_timeout_s", 5),
+            ("health_timeout_s", 3),
+            ("home_timeout_s", 10),
+            ("home_position_tolerance_m", 0.02),
+            ("home_orientation_tolerance_rad", 0.15),
+        ):
+            if float(side_cfg.get(name, default)) <= 0:
+                raise ValueError(f"robot.{side}.{name} must be positive")
+        if float(side_cfg.get("hand_home_wait_s", 8)) < 0:
+            raise ValueError(
+                f"robot.{side}.hand_home_wait_s must be non-negative"
+            )
+        for name, default in (
+            ("speed_percent", 20),
+            ("home_speed_percent", 10),
+        ):
+            value = int(side_cfg.get(name, default))
+            if not 1 <= value <= 100:
+                raise ValueError(f"robot.{side}.{name} must be in [1, 100]")
     for camera in ("scene", "wrist_left", "wrist_right"):
         if camera not in cfg["cameras"]:
             raise ValueError(f"cameras.{camera} is required")
@@ -125,6 +197,18 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         if float(runtime.get(name, 1)) <= 0:
             raise ValueError(f"runtime.{name} must be positive")
     episode = cfg.setdefault("episode", {})
+    if (
+        bool(cfg["robot"].get("enabled", False))
+        and bool(cfg["robot"].get("require_home_before_start", True))
+        and bool(episode.get("auto_start", False))
+    ):
+        raise ValueError(
+            "真机 require_home_before_start=true 时不能启用 episode.auto_start；"
+            "请启动后显式执行 home"
+        )
+    for name in ("worker_stop_timeout_s", "state_stop_timeout_s"):
+        if float(cfg["robot"].get(name, 3)) <= 0:
+            raise ValueError(f"robot.{name} must be positive")
     for name, default in (("min_frames", 10), ("command_queue_capacity", 32)):
         if int(episode.get(name, default)) <= 0:
             raise ValueError(f"episode.{name} must be positive")

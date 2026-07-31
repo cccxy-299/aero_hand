@@ -78,7 +78,10 @@ def _periodic(stop_event: Any, hz: float, callback: Callable[[int], None]) -> No
             deadline_ns = time.perf_counter_ns()
 
 
-def _make_safety(cfg: dict[str, Any]) -> dict[str, SafetyGate]:
+def _make_safety(
+    cfg: dict[str, Any],
+    initial_poses: dict[str, np.ndarray] | None = None,
+) -> dict[str, SafetyGate]:
     result: dict[str, SafetyGate] = {}
     for side in SIDES:
         side_cfg = cfg["robot"][side]
@@ -91,21 +94,50 @@ def _make_safety(cfg: dict[str, Any]) -> dict[str, SafetyGate]:
                 np.asarray(cfg["robot"]["hand_max"], np.float32),
                 int(float(cfg["alignment"]["teleop_timeout_ms"]) * 1e6),
             ),
-            np.asarray(side_cfg["initial_pose"], np.float32),
+            (
+                initial_poses[side]
+                if initial_poses is not None
+                else np.asarray(side_cfg["initial_pose"], np.float32)
+            ),
         )
     return result
 
 
-def _make_control_components(cfg: dict[str, Any]) -> tuple[Any, Any, dict[str, SafetyGate]]:
+def _make_robot(cfg: dict[str, Any]) -> Any:
     if bool(cfg["robot"]["enabled"]):
         # 真机 SDK 只在控制子进程内加载，避免继承 CAN/串口内部状态。
         from hardware_adapters import DualPiperAerohand
 
-        robot = DualPiperAerohand(cfg["robot"])
+        return DualPiperAerohand(cfg["robot"])
+    from adapters import SimRobot
+
+    return SimRobot(int(cfg["robot"]["hand_dof"]))
+
+
+def _episode_initial_poses(
+    cfg: dict[str, Any], robot_state: BimanualRobotState
+) -> dict[str, np.ndarray]:
+    """以 episode 开始时的真实反馈作为 VIVE 和安全限速的参考原点。"""
+    result: dict[str, np.ndarray] = {}
+    for side in SIDES:
+        pose = np.asarray(getattr(robot_state, side).arm_pose, dtype=np.float32)
+        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+            if bool(cfg["robot"]["enabled"]):
+                raise RuntimeError(f"{side} Piper 当前末端位姿无效，拒绝 start")
+            pose = np.asarray(cfg["robot"][side]["initial_pose"], np.float32)
+        result[side] = pose.copy()
+    return result
+
+
+def _make_episode_control_components(
+    cfg: dict[str, Any], robot_state: BimanualRobotState
+) -> tuple[Any, dict[str, SafetyGate]]:
+    initial_poses = _episode_initial_poses(cfg, robot_state)
+    if bool(cfg["robot"]["enabled"]):
         retargeter = HardwareBimanualRetargeter(
             {
                 side: SideRetargetConfig(
-                    np.asarray(cfg["robot"][side]["initial_pose"], np.float32),
+                    initial_poses[side],
                     float(cfg["robot"][side].get("vive_scale", 0.6)),
                     np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
                 )
@@ -113,11 +145,8 @@ def _make_control_components(cfg: dict[str, Any]) -> tuple[Any, Any, dict[str, S
             }
         )
     else:
-        from adapters import SimRobot
-
-        robot = SimRobot(int(cfg["robot"]["hand_dof"]))
         retargeter = PassthroughRetargeter()
-    return robot, retargeter, _make_safety(cfg)
+    return retargeter, _make_safety(cfg, initial_poses)
 
 
 def _control_process(
@@ -127,7 +156,7 @@ def _control_process(
     control_queue: Any,
     status_queue: Any,
 ) -> None:
-    """控制进程：空闲时只监听 UDP/命令，start 后才连接并控制机器人。"""
+    """控制进程：硬件会话常驻，episode 只切换 enable/disable 与命令线程。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [device-b/control] %(message)s",
@@ -160,24 +189,26 @@ def _control_process(
 
     def deactivate(reason: str) -> None:
         nonlocal robot, retargeter, safety, active, state_thread, state_stop
-        if not active and robot is None:
+        if not active:
+            teleop_buffer.clear()
             return
         # 先关闭控制入口，再停止状态读取和硬件工作线程。
         active = False
         if state_stop is not None:
             state_stop.set()
+        state_thread_stuck = False
         if state_thread is not None:
-            state_thread.join(timeout=3)
+            state_thread.join(
+                timeout=float(cfg["robot"].get("state_stop_timeout_s", 3.0))
+            )
+            state_thread_stuck = state_thread.is_alive()
+        deactivate_error: BaseException | None = None
         if robot is not None:
             try:
-                robot.stop()
-            except Exception:
-                LOG.exception("机器人停止失败")
-            try:
-                robot.disconnect()
-            except Exception:
-                LOG.exception("机器人断开失败")
-        robot = None
+                robot.deactivate()
+            except BaseException as exc:
+                deactivate_error = exc
+                LOG.exception("机器人停用失败")
         retargeter = None
         safety = None
         state_thread = None
@@ -189,7 +220,15 @@ def _control_process(
             "control_stopped",
             reason=reason,
             metrics=dict(metrics),
+            hardware=robot.status_snapshot() if robot is not None else None,
         )
+        if state_thread_stuck:
+            raise RuntimeError(
+                "机器人状态读取线程未及时停止；为避免跨 episode 复用阻塞的 SDK "
+                "调用，终止当前 control 硬件会话"
+            )
+        if deactivate_error is not None:
+            raise RuntimeError("机器人停用失败") from deactivate_error
 
     def activate() -> None:
         nonlocal robot, retargeter, safety, active, state_thread, state_stop
@@ -202,11 +241,23 @@ def _control_process(
                 reason="already_active",
             )
             return
-        candidate = None
+        if robot is None:
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command="start",
+                reason="hardware_not_initialized",
+            )
+            return
         try:
-            candidate, candidate_retargeter, candidate_safety = _make_control_components(cfg)
-            candidate.connect()
-            robot = candidate
+            # 每个 episode 都从真实当前位置重新建立 VIVE 参考和安全门历史；
+            # 机器人 SDK 实例本身不重建。
+            current_state = robot.read_state()
+            candidate_retargeter, candidate_safety = (
+                _make_episode_control_components(cfg, current_state)
+            )
+            robot.activate()
             retargeter = candidate_retargeter
             safety = candidate_safety
             teleop_buffer.clear()
@@ -259,23 +310,73 @@ def _control_process(
                 "control",
                 "control_started",
                 session=metrics["control_sessions"],
+                hardware=robot.status_snapshot(),
             )
-        except BaseException:
-            if candidate is not None:
-                try:
-                    candidate.stop()
-                except Exception:
-                    pass
-                try:
-                    candidate.disconnect()
-                except Exception:
-                    pass
-            raise
+        except BaseException as exc:
+            try:
+                robot.deactivate()
+            except Exception:
+                LOG.exception("start 失败后的机器人停用失败")
+            retargeter = None
+            safety = None
+            state_stop = None
+            state_thread = None
+            teleop_buffer.clear()
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command="start",
+                reason=repr(exc),
+                hardware=robot.status_snapshot(),
+            )
 
     def handle_command(command: dict[str, Any]) -> None:
         kind = str(command.get("kind", "")).lower()
         if kind == "start":
             activate()
+        elif kind == "home":
+            if active:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="home",
+                    reason="episode_active",
+                )
+                return
+            if robot is None:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="home",
+                    reason="hardware_not_initialized",
+                )
+                return
+            _status_put(
+                status_queue,
+                "control",
+                "control_home_started",
+                hardware=robot.status_snapshot(),
+            )
+            try:
+                robot.home()
+            except BaseException as exc:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_home_failed",
+                    error=repr(exc),
+                    hardware=robot.status_snapshot(),
+                )
+                return
+            _status_put(
+                status_queue,
+                "control",
+                "control_home_completed",
+                hardware=robot.status_snapshot(),
+            )
         elif kind in {"stop", "discard"}:
             deactivate(kind)
         elif kind == "status":
@@ -285,10 +386,30 @@ def _control_process(
                 "control_status",
                 active=active,
                 metrics=dict(metrics),
+                hardware=robot.status_snapshot() if robot is not None else None,
+            )
+        else:
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command=kind,
+                reason="unknown_command",
             )
 
     try:
-        # UDP/时钟同步是空闲态唯一常驻 I/O，不会触发机器人动作。
+        # SDK 对象和 CAN/串口句柄只在本 control 子进程中创建，并跨 episode 常驻。
+        robot = _make_robot(cfg)
+        _status_put(status_queue, "control", "hardware_initializing")
+        robot.initialize()
+        _status_put(
+            status_queue,
+            "control",
+            "hardware_ready",
+            hardware=robot.status_snapshot(),
+        )
+
+        # 空闲态保留 UDP/时钟同步和已连接但 disable 的机器人硬件。
         receiver = UdpReceiver(
             int(cfg["network"]["data_port"]),
             ClockMapper(),
@@ -305,6 +426,7 @@ def _control_process(
             "ready",
             udp_port=cfg["network"]["data_port"],
             active=False,
+            hardware=robot.status_snapshot(),
         )
 
         last_report_ns = time.perf_counter_ns()
@@ -397,7 +519,15 @@ def _control_process(
             receiver.close()
         if receiver_thread is not None:
             receiver_thread.join(timeout=2)
-        deactivate("shutdown")
+        try:
+            deactivate("shutdown")
+        except Exception:
+            LOG.exception("shutdown 时机器人停用失败")
+        if robot is not None:
+            try:
+                robot.close()
+            except Exception:
+                LOG.exception("机器人最终释放失败")
         _status_put(status_queue, "control", "stopped", metrics=dict(metrics))
 
 
@@ -1495,7 +1625,7 @@ def _recorder_process(
 def run_robot_multiprocess(
     cfg: dict[str, Any], run_seconds: float | None = None
 ) -> None:
-    """设备 B 父进程：监督两个子进程，并提供人工 episode 控制台。"""
+    """设备 B 父进程：监督控制、记录及三路相机进程，并提供人工控制台。"""
     import sys
 
     runtime_cfg = cfg.get("runtime", {})
@@ -1575,12 +1705,16 @@ def run_robot_multiprocess(
         )
     errors: list[dict[str, Any]] = []
     desired_active = bool(episode_cfg.get("auto_start", False))
+    home_in_progress = False
 
     def request_stop(*_: Any) -> None:
         stop_event.set()
 
     def submit_episode_command(kind: str, task: str | None = None) -> None:
         nonlocal desired_active
+        if kind == "start" and home_in_progress:
+            LOG.warning("home 尚未完成，拒绝 start")
+            return
         if kind == "start":
             desired_active = True
         elif kind in {"stop", "discard"}:
@@ -1597,9 +1731,26 @@ def run_robot_multiprocess(
             except queue.Full:
                 LOG.error("control 命令队列已满，命令被拒绝：%s", kind)
 
+    def submit_control_command(kind: str) -> None:
+        nonlocal home_in_progress
+        if kind == "home":
+            if desired_active:
+                LOG.warning("episode 正在启动或运行，拒绝 home")
+                return
+            if home_in_progress:
+                LOG.warning("home 已在执行，拒绝重复命令")
+                return
+            home_in_progress = True
+        try:
+            control_queue.put_nowait({"kind": kind})
+        except queue.Full:
+            if kind == "home":
+                home_in_progress = False
+            LOG.error("control 命令队列已满，命令被拒绝：%s", kind)
+
     def console_loop() -> None:
         LOG.info(
-            "Episode 控制：start [任务描述] | stop | discard | status | quit"
+            "控制命令：home | start [任务描述] | stop | discard | status | quit"
         )
         while not stop_event.is_set():
             line = sys.stdin.readline()
@@ -1609,6 +1760,9 @@ def run_robot_multiprocess(
             command = command.lower()
             if command in {"start", "stop", "discard", "status"}:
                 submit_episode_command(command, value or None)
+            elif command == "home":
+                # home 只操作已连接的机器人，不启动相机，也不创建 episode。
+                submit_control_command("home")
             elif command in {"quit", "exit", "q"}:
                 stop_event.set()
                 return
@@ -1649,6 +1803,8 @@ def run_robot_multiprocess(
                     stop_event.set()
                 elif kind == "ready":
                     LOG.info("%s 子进程已就绪：%s", status.get("process"), status)
+                elif kind in {"hardware_initializing", "hardware_ready"}:
+                    LOG.info("HARDWARE %s", json.dumps(status, ensure_ascii=False))
                 elif kind == "metrics":
                     LOG.info("%s", json.dumps(status, ensure_ascii=False))
                 elif str(kind).startswith("episode_"):
@@ -1666,6 +1822,26 @@ def run_robot_multiprocess(
                         desired_active = False
                 elif str(kind).startswith("control_"):
                     LOG.info("CONTROL %s", json.dumps(status, ensure_ascii=False))
+                    if kind in {
+                        "control_home_completed",
+                        "control_home_failed",
+                    } or (
+                        kind == "control_rejected"
+                        and status.get("command") == "home"
+                    ):
+                        home_in_progress = False
+                    if (
+                        kind == "control_rejected"
+                        and status.get("command") == "start"
+                        and desired_active
+                    ):
+                        # 相机已经进入 recording，但机器人未能安全使能；
+                        # 自动丢弃本次 episode，避免保存没有真实动作的数据。
+                        desired_active = False
+                        try:
+                            episode_queue.put_nowait({"kind": "discard"})
+                        except queue.Full:
+                            LOG.error("机器人 start 被拒绝，但 episode 队列已满")
             except queue.Empty:
                 pass
 

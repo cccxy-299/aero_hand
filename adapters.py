@@ -21,11 +21,13 @@ class OperatorSource(Protocol):
 
 
 class RobotIO(Protocol):
-    def connect(self) -> None: ...
+    def initialize(self) -> None: ...
+    def home(self) -> None: ...
+    def activate(self) -> None: ...
     def command(self, value: BimanualControlCommand) -> None: ...
     def read_state(self) -> BimanualRobotState: ...
-    def stop(self) -> None: ...
-    def disconnect(self) -> None: ...
+    def deactivate(self) -> None: ...
+    def close(self) -> None: ...
 
 
 class CameraIO(Protocol):
@@ -67,6 +69,8 @@ class SimRobot:
     """双 Piper + 双 Aerohand 的内存仿真适配器。"""
 
     def __init__(self, hand_dof: int = 7) -> None:
+        self.state = "new"
+        self.homed = False
         self._command = BimanualControlCommand(
             ControlCommand(
                 np.array([0.25, 0.16, 0.25, 0, 0, 0], np.float32),
@@ -79,10 +83,38 @@ class SimRobot:
             0,
         )
 
-    def connect(self) -> None:
-        pass
+    @property
+    def active(self) -> bool:
+        return self.state == "active"
+
+    def status_snapshot(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "initialized": self.state not in {"new", "closed"},
+            "active": self.active,
+            "homed": self.homed,
+        }
+
+    def initialize(self) -> None:
+        if self.state == "idle_disabled":
+            return
+        if self.state != "new":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 initialize")
+        self.state = "idle_disabled"
+
+    def home(self) -> None:
+        if self.state != "idle_disabled":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 home")
+        self.homed = True
+
+    def activate(self) -> None:
+        if self.state != "idle_disabled":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
+        self.state = "active"
 
     def command(self, value: BimanualControlCommand) -> None:
+        if not self.active:
+            raise RuntimeError("仿真机器人尚未 activate")
         self._command = value
 
     def read_state(self) -> BimanualRobotState:
@@ -95,11 +127,24 @@ class SimRobot:
             one_side(self._command.left), one_side(self._command.right)
         )
 
+    def deactivate(self) -> None:
+        if self.state == "active":
+            self.state = "idle_disabled"
+
+    def close(self) -> None:
+        self.deactivate()
+        self.state = "closed"
+
+    # 兼容旧单进程仿真入口。
+    def connect(self) -> None:
+        self.initialize()
+        self.activate()
+
     def stop(self) -> None:
-        pass
+        self.deactivate()
 
     def disconnect(self) -> None:
-        pass
+        self.close()
 
 
 class SimCamera:

@@ -24,11 +24,6 @@ from retarget import (
     PassthroughRetargeter,
     SideRetargetConfig,
 )
-from hardware_adapters import (
-    DualPiperAerohand,
-    IntelRealSenseColorCamera,
-    OpenCVWristCamera,
-)
 from safety import SafetyConfig, SafetyGate
 
 
@@ -52,6 +47,12 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpRe
             np.asarray(side_cfg["initial_pose"], np.float32),
         )
     if bool(cfg["robot"]["enabled"]):
+        # 旧单进程构造路径按需加载；正式 robot_main 不会在父进程加载硬件 SDK。
+        from hardware_adapters import (
+            DualPiperAerohand,
+            IntelRealSenseColorCamera,
+            OpenCVWristCamera,
+        )
 
         robot_adapter = DualPiperAerohand(cfg["robot"])
         camera_adapters = {

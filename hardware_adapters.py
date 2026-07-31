@@ -7,8 +7,6 @@ import time
 from typing import Any, Callable
 
 import numpy as np
-from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
-from aero_open_sdk.aero_hand import AeroHand
 
 from model import (
     BimanualControlCommand,
@@ -58,20 +56,27 @@ class LatestCommandWorker:
                 self.last_error = repr(exc)
                 LOG.exception("%s 下发失败", self.name)
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 3.0) -> bool:
+        """丢弃未执行命令并等待工作线程退出。
+
+        返回 False 表示线程仍阻塞在硬件 SDK 中。此时上层必须保持机械臂 disable，
+        且不能在同一硬件会话中再次进入 ACTIVE。
+        """
         while True:
             try:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
         self.queue.put(None)
-        self.thread.join(timeout=3)
+        self.thread.join(timeout=timeout_s)
+        return not self.thread.is_alive()
 
 
 class DualPiperAerohand:
     """设备 B 的双 Piper + 双 Aerohand 真实硬件适配器。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        # 构造函数只初始化 Python 状态，不打开 CAN/串口，也不触发真实运动。
         self.cfg = cfg
         self.arms: dict[str, Any] = {}
         self.hands: dict[str, Any] = {}
@@ -79,55 +84,294 @@ class DualPiperAerohand:
         self.workers: dict[str, LatestCommandWorker] = {}
         self.last_hand = {side: np.zeros(7, np.float32) for side in ("left", "right")}
         self.last_command: BimanualControlCommand | None = None
+        self.state = "new"
+        self.homed = False
+        self._lifecycle_lock = threading.RLock()
 
-    def connect(self) -> None:
-        # 同一适配器允许跨 episode 重新连接；旧会话容器必须已经由 disconnect 清空。
-        if self.arms or self.hands or self.workers:
-            raise RuntimeError("机器人适配器仍持有上一会话资源，拒绝重复 connect")
-        try:
-            from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
-            from aero_open_sdk.aero_hand import AeroHand
-        except ImportError as exc:
+    @property
+    def initialized(self) -> bool:
+        return self.state not in {"new", "closed"}
+
+    @property
+    def active(self) -> bool:
+        return self.state == "active"
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "initialized": self.initialized,
+            "active": self.active,
+            "homed": self.homed,
+            "connected_arms": sorted(self.arms),
+            "connected_hands": sorted(self.hands),
+            "worker_errors": {
+                name: worker.last_error
+                for name, worker in self.workers.items()
+                if worker.last_error is not None
+            },
+        }
+
+    @staticmethod
+    def _message_array(value: Any, expected_shape: tuple[int, ...]) -> np.ndarray:
+        raw = getattr(value, "msg", value)
+        result = np.asarray(raw, dtype=np.float32)
+        if result.shape != expected_shape or not np.all(np.isfinite(result)):
             raise RuntimeError(
-                "真实机器人模式需要安装 pyAgxArm 和 aero_open_sdk"
-            ) from exc
-
-        for side in ("left", "right"):
-            print(f"{side} 侧设备连接中！")
-            side_cfg = self.cfg[side]
-
-            arm_config = create_agx_arm_config(
-                robot=ArmModel.PIPER,
-                firmeware_version=PiperFW.DEFAULT,
-                interface=side_cfg["interface"],
-                channel=str(side_cfg.get("channel", "0")),
-                bitrate=int(side_cfg.get("bitrate", 1_000_000)),
+                f"硬件反馈维度或数值非法，期望 {expected_shape}，实际 {result.shape}"
             )
-            print(f"{side} 侧 机械臂 连接中~~~~~")
-            arm = AgxArmFactory.create_arm(arm_config)
-            arm.connect()
-            deadline = time.monotonic() + float(side_cfg.get("enable_timeout_s", 5))
-            while not arm.enable():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"{side} Piper 使能超时")
+        return result
+
+    def _read_arm_feedback(self, side: str) -> tuple[np.ndarray, np.ndarray]:
+        arm = self.arms[side]
+        flange = arm.get_flange_pose()
+        joints = arm.get_joint_angles()
+        if flange is None or joints is None:
+            raise RuntimeError(f"{side} Piper 未返回完整状态")
+        return (
+            self._message_array(flange, (6,)),
+            self._message_array(joints, (6,)),
+        )
+
+    def _read_hand_feedback(self, side: str) -> np.ndarray:
+        state = self.hands[side].get_joint_positions_compact()
+        result = self._message_array(state, (7,))
+        self.last_hand[side] = result.copy()
+        return result
+
+    def _wait_for_feedback(self, side: str) -> None:
+        timeout_s = float(self.cfg[side].get("health_timeout_s", 3.0))
+        deadline = time.monotonic() + timeout_s
+        last_error: BaseException | None = None
+        while time.monotonic() < deadline:
+            try:
+                self._read_arm_feedback(side)
+                self._read_hand_feedback(side)
+                return
+            except BaseException as exc:
+                last_error = exc
                 time.sleep(0.05)
-            arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
-            self.arms[side] = arm
-            hand = AeroHand(port=side_cfg["hand_port"])
-            self.hands[side] = hand
-            print(f"{side} 侧 灵巧手 连接中~~~~~")
-            if bool(side_cfg.get("home_on_connect", False)):
-                arm.move_j(side_cfg["initial_pose"])
-                hand.send_homing()
-            print(f"{side} 侧 设备连接成功~~~~")
+        raise RuntimeError(
+            f"{side} 侧设备在 {timeout_s:.1f}s 内未返回有效状态: {last_error!r}"
+        )
 
+    def _disable_all_arms(self) -> None:
         for side in ("left", "right"):
-            self.workers[f"arm_{side}"] = LatestCommandWorker(
-                f"piper-{side}", lambda value, s=side: self._send_arm(s, value)
+            arm = self.arms.get(side)
+            if arm is None:
+                continue
+            try:
+                arm.disable()
+            except Exception:
+                LOG.exception("%s Piper disable 失败", side)
+
+    def initialize(self) -> None:
+        """创建并连接全部硬件，最后确保双臂处于 disable 状态。
+
+        该方法只应在 control 子进程启动时调用一次。任何一侧失败都会回滚已经打开的
+        左右臂和灵巧手，禁止以单侧降级方式进入 READY。
+        """
+        with self._lifecycle_lock:
+            if self.state == "idle_disabled":
+                return
+            if self.state != "new":
+                raise RuntimeError(f"当前状态 {self.state} 不允许 initialize")
+            self.state = "initializing"
+            try:
+                from pyAgxArm import (
+                    AgxArmFactory,
+                    ArmModel,
+                    PiperFW,
+                    create_agx_arm_config,
+                )
+                from aero_open_sdk.aero_hand import AeroHand
+            except ImportError as exc:
+                self.state = "fault"
+                raise RuntimeError(
+                    "真实机器人模式需要安装 pyAgxArm 和 aero_open_sdk"
+                ) from exc
+
+            try:
+                # 先连接并立即 disable 两台机械臂，避免第二侧初始化期间第一侧保持使能。
+                for side in ("left", "right"):
+                    side_cfg = self.cfg[side]
+                    arm_config = create_agx_arm_config(
+                        robot=ArmModel.PIPER,
+                        firmeware_version=PiperFW.DEFAULT,
+                        interface=side_cfg["interface"],
+                        channel=str(side_cfg.get("channel", "0")),
+                        bitrate=int(side_cfg.get("bitrate", 1_000_000)),
+                    )
+                    LOG.info("%s Piper 正在连接", side)
+                    arm = AgxArmFactory.create_arm(arm_config)
+                    # 先保存句柄，保证 connect/disable 中途失败时 close() 仍能清理。
+                    self.arms[side] = arm
+                    arm.connect()
+                    arm.disable()
+                    arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
+
+                for side in ("left", "right"):
+                    LOG.info("%s Aerohand 正在连接", side)
+                    hand = AeroHand(port=self.cfg[side]["hand_port"])
+                    self.hands[side] = hand
+
+                for side in ("left", "right"):
+                    self._wait_for_feedback(side)
+                self.state = "idle_disabled"
+                LOG.info("双 Piper/双 Aerohand 已连接，双臂保持 disable")
+            except BaseException:
+                self.state = "fault"
+                self.close()
+                raise
+
+    def _validated_home_pose(self, side: str) -> np.ndarray:
+        side_cfg = self.cfg[side]
+        if "home_pose" not in side_cfg:
+            raise RuntimeError(
+                f"robot.{side}.home_pose 未配置；为避免把 initial_pose 的坐标语义"
+                "误当作回零目标，拒绝执行真实运动"
             )
-            self.workers[f"hand_{side}"] = LatestCommandWorker(
-                f"aerohand-{side}", lambda value, s=side: self._send_hand(s, value)
+        pose = np.asarray(side_cfg["home_pose"], dtype=np.float32)
+        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+            raise RuntimeError(f"robot.{side}.home_pose 必须是有效的6维末端位姿")
+        lower = np.asarray(side_cfg["workspace_min"], dtype=np.float32)
+        upper = np.asarray(side_cfg["workspace_max"], dtype=np.float32)
+        if np.any(pose[:3] < lower) or np.any(pose[:3] > upper):
+            raise RuntimeError(
+                f"robot.{side}.home_pose 位置 {pose[:3].tolist()} 超出工作空间"
             )
+        return pose
+
+    def _enable_arm(self, side: str) -> None:
+        arm = self.arms[side]
+        timeout_s = float(self.cfg[side].get("enable_timeout_s", 5.0))
+        deadline = time.monotonic() + timeout_s
+        while not arm.enable():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"{side} Piper 使能超时")
+            time.sleep(0.05)
+
+    def _wait_motion_done(
+        self, side: str, target: np.ndarray, timeout_s: float
+    ) -> None:
+        # move_p 通常异步返回，先留出启动运动状态更新的时间。
+        time.sleep(0.3)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            status = self.arms[side].get_arm_status()
+            motion_status = getattr(getattr(status, "msg", None), "motion_status", None)
+            if motion_status == 0:
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError(f"{side} Piper 回零运动超过 {timeout_s:.1f}s")
+
+        actual, _ = self._read_arm_feedback(side)
+        position_error = float(np.linalg.norm(actual[:3] - target[:3]))
+        angle_delta = actual[3:] - target[3:]
+        angle_error = float(
+            np.max(np.abs(np.arctan2(np.sin(angle_delta), np.cos(angle_delta))))
+        )
+        position_tolerance = float(
+            self.cfg[side].get("home_position_tolerance_m", 0.02)
+        )
+        orientation_tolerance = float(
+            self.cfg[side].get("home_orientation_tolerance_rad", 0.15)
+        )
+        if (
+            position_error > position_tolerance
+            or angle_error > orientation_tolerance
+        ):
+            raise RuntimeError(
+                f"{side} Piper 回零校验失败: position_error={position_error:.4f}m, "
+                f"orientation_error={angle_error:.4f}rad"
+            )
+
+    def home(self) -> None:
+        """显式执行双侧回零；运动完成并校验后再次 disable 双臂。"""
+        with self._lifecycle_lock:
+            if self.state != "idle_disabled":
+                raise RuntimeError(f"当前状态 {self.state} 不允许 home")
+            # 在任何机械臂使能之前一次性校验左右目标，避免单侧先动后才发现另一侧配置错误。
+            targets = {
+                side: self._validated_home_pose(side)
+                for side in ("left", "right")
+            }
+            self.state = "homing"
+            try:
+                # 双臂依次回零，减少双臂轨迹同时运动造成的碰撞风险。
+                for side in ("left", "right"):
+                    arm = self.arms[side]
+                    self._enable_arm(side)
+                    try:
+                        arm.set_speed_percent(
+                            int(self.cfg[side].get("home_speed_percent", 10))
+                        )
+                        arm.move_p(targets[side].tolist())
+                        self._wait_motion_done(
+                            side,
+                            targets[side],
+                            float(self.cfg[side].get("home_timeout_s", 10.0)),
+                        )
+                    finally:
+                        arm.disable()
+                    LOG.info("%s Piper 回零完成并已 disable", side)
+
+                for side in ("left", "right"):
+                    result = self.hands[side].send_homing()
+                    if result is False:
+                        raise RuntimeError(f"{side} Aerohand homing 返回失败")
+                    wait_s = float(self.cfg[side].get("hand_home_wait_s", 8.0))
+                    if wait_s > 0:
+                        time.sleep(wait_s)
+                    self._read_hand_feedback(side)
+                    LOG.info("%s Aerohand 回零完成", side)
+
+                self.homed = True
+                self.state = "idle_disabled"
+            except BaseException:
+                self.homed = False
+                self._disable_all_arms()
+                self.state = "fault"
+                raise
+
+    def activate(self) -> None:
+        """episode start：健康检查、双臂使能并启动非阻塞命令工作线程。"""
+        with self._lifecycle_lock:
+            if self.state != "idle_disabled":
+                raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
+            if bool(self.cfg.get("require_home_before_start", True)) and not self.homed:
+                raise RuntimeError("尚未成功执行显式 home，拒绝 start")
+
+            for side in ("left", "right"):
+                self._wait_for_feedback(side)
+
+            enabled_sides: list[str] = []
+            try:
+                for side in ("left", "right"):
+                    self._enable_arm(side)
+                    enabled_sides.append(side)
+                    self.arms[side].set_speed_percent(
+                        int(self.cfg[side].get("speed_percent", 20))
+                    )
+
+                for side in ("left", "right"):
+                    self.workers[f"arm_{side}"] = LatestCommandWorker(
+                        f"piper-{side}",
+                        lambda value, s=side: self._send_arm(s, value),
+                    )
+                    self.workers[f"hand_{side}"] = LatestCommandWorker(
+                        f"aerohand-{side}",
+                        lambda value, s=side: self._send_hand(s, value),
+                    )
+                self.state = "active"
+            except BaseException:
+                for side in enabled_sides:
+                    try:
+                        self.arms[side].disable()
+                    except Exception:
+                        LOG.exception("%s Piper 使能失败后的回滚 disable 失败", side)
+                self.state = "fault"
+                raise
 
     def _send_arm(self, side: str, value: np.ndarray) -> None:
         with self.arm_locks[side]:
@@ -148,6 +392,16 @@ class DualPiperAerohand:
         self.last_hand[side] = state if state.shape == (7,) else value.copy()
 
     def command(self, value: BimanualControlCommand) -> None:
+        if self.state != "active":
+            raise RuntimeError(f"当前状态 {self.state} 不允许下发控制命令")
+        worker_errors = {
+            name: worker.last_error
+            for name, worker in self.workers.items()
+            if worker.last_error is not None
+        }
+        if worker_errors:
+            self.state = "fault"
+            raise RuntimeError(f"硬件命令线程发生异常: {worker_errors}")
         self.last_command = value
         for side in ("left", "right"):
             side_value: ControlCommand = getattr(value, side)
@@ -155,33 +409,54 @@ class DualPiperAerohand:
             self.workers[f"hand_{side}"].submit(side_value.hand_joints)
 
     def read_state(self) -> BimanualRobotState:
+        if not self.initialized:
+            raise RuntimeError("机器人硬件尚未 initialize")
         states: dict[str, RobotState] = {}
         for side in ("left", "right"):
             with self.arm_locks[side]:
-                flange = None
-                joints = None
-                fp = self.arms[side].get_flange_pose()
-                ja = self.arms[side].get_joint_angles()
-                if fp is not None:
-                    flange = np.asarray(fp.msg, np.float32)
-                if ja is not None:
-                    joints = np.asarray(ja.msg, np.float32)
+                flange, joints = self._read_arm_feedback(side)
 
             states[side] = RobotState(flange, joints, self.last_hand[side].copy())
         return BimanualRobotState(states["left"], states["right"])
 
-    def stop(self) -> None:
-        for worker in list(self.workers.values()):
-            worker.close()
-        self.workers.clear()
+    def deactivate(self) -> None:
+        """episode stop：停止下发并 disable 双臂，保留 CAN/串口硬件会话。"""
+        with self._lifecycle_lock:
+            if self.state in {"new", "closed", "idle_disabled"} and not self.workers:
+                return
+            previous_state = self.state
+            self.state = "deactivating"
+            stuck_workers: list[str] = []
+            for name, worker in list(self.workers.items()):
+                if not worker.close(
+                    float(self.cfg.get("worker_stop_timeout_s", 3.0))
+                ):
+                    stuck_workers.append(name)
+            self.workers.clear()
+            self._disable_all_arms()
+            self.last_command = None
+            if stuck_workers:
+                self.state = "fault"
+                raise RuntimeError(
+                    f"硬件命令线程未及时停止: {stuck_workers}；双臂已 disable，"
+                    "当前会话禁止再次 activate"
+                )
+            self.state = (
+                "fault" if previous_state == "fault" else "idle_disabled"
+            )
 
-    def disconnect(self) -> None:
+    def close(self) -> None:
+        """进程退出时最终释放全部硬件句柄。"""
+        with self._lifecycle_lock:
+            try:
+                self.deactivate()
+            except Exception:
+                LOG.exception("机器人 deactivate 失败，继续执行最终硬件释放")
+            self._disable_all_arms()
         for side in ("left", "right"):
             arm = self.arms.get(side)
             if arm is not None:
                 try:
-                    arm.disable()
-                    time.sleep(3)
                     arm.disconnect()
                 except Exception:
                     LOG.exception("%s Piper 断开失败", side)
@@ -195,6 +470,19 @@ class DualPiperAerohand:
             except Exception:
                 LOG.exception("%s Aerohand 断开失败", side)
         self.hands.clear()
+        self.homed = False
+        self.state = "closed"
+
+    # 兼容旧单进程入口；正式真机多进程路径使用显式生命周期方法。
+    def connect(self) -> None:
+        self.initialize()
+        self.activate()
+
+    def stop(self) -> None:
+        self.deactivate()
+
+    def disconnect(self) -> None:
+        self.close()
 
 
 class OpenCVWristCamera:

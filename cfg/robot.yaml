@@ -41,13 +41,26 @@ episode:
 robot:
   enabled: true
   hand_dof: 7
+  # 必须先在终端显式执行 home 并成功，之后才允许 start episode。
+  require_home_before_start: true
+  worker_stop_timeout_s: 3
+  state_stop_timeout_s: 3
   left:
     interface: "socketcan"
     channel: "can_left"
     bitrate: 1000000
     speed_percent: 20
     hand_port: "/dev/ttyACM1"
-    home_on_connect: false
+    enable_timeout_s: 5
+    health_timeout_s: 3
+    # 请在真机标定并确认无碰撞后填写6维末端位姿 [x,y,z,rx,ry,rz]。
+    # 未配置 home_pose 时，home 命令会安全拒绝，不会执行运动。
+    # home_pose: [0.25, 0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    home_speed_percent: 10
+    home_timeout_s: 10
+    home_position_tolerance_m: 0.02
+    home_orientation_tolerance_rad: 0.15
+    hand_home_wait_s: 8
     vive_scale: 0.3
     initial_pose: [0, 0, 0, 0 , 0.2201, -1.6187]
     fixed_orientation: [-1.8968, 0.2201, -1.6187]
@@ -61,7 +74,15 @@ robot:
     bitrate: 1000000
     speed_percent: 20
     hand_port: "/dev/ttyACM0"
-    home_on_connect: false
+    enable_timeout_s: 5
+    health_timeout_s: 3
+    # 右臂 home_pose 必须单独标定，不能照抄左臂；尤其要检查双臂回零轨迹。
+    # home_pose: [0.25, -0.16, 0.25, -1.8968, 0.2201, -1.6187]
+    home_speed_percent: 10
+    home_timeout_s: 10
+    home_position_tolerance_m: 0.02
+    home_orientation_tolerance_rad: 0.15
+    hand_home_wait_s: 8
     vive_scale: 0.3
     initial_pose: [0, 0, 0, 0, 0.2201, -1.6187]
     fixed_orientation: [-1.8968, 0.2201, -1.6187]
