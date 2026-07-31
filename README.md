@@ -99,6 +99,12 @@ episode，也不会在遥操作开始前重复 disable/enable。相机启动期�
 退出时最终释放。下一次 `start` 复用硬件会话，但不会复用旧 episode 的命令、图像、
 state、action 或 VIVE 参考。
 
+`control_hz` 是安全计算频率，不等于真实硬件命令频率。双臂 `move_p` 默认通过
+`robot.arm_command_hz: 30` 限频，等待期间只保留最新目标；双手默认通过
+`robot.hand_command_hz: 60` 限频。控制线程不会等待硬件 SDK。运行日志中的
+`hardware.workers` 会输出 `effective_hz`、`dropped` 和 `coalesced`，用于判断
+命令是否过密或 SDK 调用是否变慢。
+
 保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
 就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。
 
@@ -179,14 +185,17 @@ TCP 和左右工作空间标定。
 不会跳转到配置中的另一套姿态。只有经过可达性验证后，才应显式改为
 `orientation_mode: configured_fixed` 并使用 `fixed_orientation`。
 
-相对位置控制沿用已验证工程的映射：
+相对位置控制使用可标定的3x3轴交换/翻转矩阵：
 
 ```text
 Piper目标位置 = start时真实法兰位置 + VIVE相对位移映射
-robot_dx = -vive_dz * vive_scale
-robot_dy = -vive_dx * vive_scale
-robot_dz =  vive_dy * vive_scale
+robot_delta = vive_to_robot_matrix @ vive_delta * vive_scale
 ```
+
+旧工程使用 OpenVR，硬编码为 `VIVE Y → Piper Z`；当前设备 A 使用 pysurvive，
+真机观察已证明该假设不成立。当前配置交换了旧映射的 Piper Y/Z 输出，使可视化
+Y 位移对应 Piper Y。首次真机验证应把 `vive_scale` 临时调小，并分别只沿可视化
+X、Y、Z 单轴移动；控制日志的 `teleop_mapping` 会同时显示输入和输出增量。
 
 左右 VIVE 参考必须由同一个有效网络包原子建立。任一侧 VIVE、MANUS 或 `valid`
 无效时不会建立/修改参考，也不会向双臂和双手发送新目标；数据恢复后继续使用原参考。

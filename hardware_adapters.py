@@ -24,18 +24,32 @@ class LatestCommandWorker:
     控制线程只做 put_nowait，不会被 CAN/串口调用阻塞。队列满时覆盖旧命令。
     """
 
-    def __init__(self, name: str, callback: Callable[[np.ndarray], None]) -> None:
+    def __init__(
+        self,
+        name: str,
+        callback: Callable[[np.ndarray], None],
+        max_hz: float | None = None,
+    ) -> None:
         self.name = name
         self.callback = callback
+        self.max_hz = float(max_hz) if max_hz is not None else None
+        if self.max_hz is not None and self.max_hz <= 0:
+            raise ValueError(f"{name} max_hz 必须大于0")
+        self.min_interval_ns = (
+            int(1e9 / self.max_hz) if self.max_hz is not None else 0
+        )
         self.queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.last_error: str | None = None
         self.dropped = 0
+        self.coalesced = 0
         self.submitted = 0
         self.completed = 0
         self.failed = 0
         self.last_duration_ms = 0.0
         self.max_duration_ms = 0.0
+        self.first_completed_ns = 0
+        self.last_completed_ns = 0
         self.thread.start()
 
     def submit(self, value: np.ndarray) -> None:
@@ -51,15 +65,41 @@ class LatestCommandWorker:
             self.dropped += 1
 
     def _run(self) -> None:
+        last_started_ns = 0
         while True:
             value = self.queue.get()
             if value is None:
                 return
+
+            # 限频等待期间继续消费单槽队列，只保留最近目标。
+            # 控制线程可以100Hz计算，真实硬件 SDK 不会被同频率轰炸。
+            if self.min_interval_ns > 0 and last_started_ns > 0:
+                deadline_ns = last_started_ns + self.min_interval_ns
+                while True:
+                    remaining_ns = deadline_ns - time.perf_counter_ns()
+                    if remaining_ns <= 0:
+                        break
+                    try:
+                        newer = self.queue.get(
+                            timeout=remaining_ns / 1e9
+                        )
+                    except queue.Empty:
+                        break
+                    if newer is None:
+                        return
+                    value = newer
+                    self.coalesced += 1
+
             started_ns = time.perf_counter_ns()
+            last_started_ns = started_ns
             try:
                 self.callback(value)
                 self.last_error = None
                 self.completed += 1
+                completed_ns = time.perf_counter_ns()
+                if self.first_completed_ns == 0:
+                    self.first_completed_ns = completed_ns
+                self.last_completed_ns = completed_ns
             except Exception as exc:  # 硬件异常留在工作线程并进入诊断
                 self.last_error = repr(exc)
                 self.failed += 1
@@ -70,11 +110,20 @@ class LatestCommandWorker:
                 self.max_duration_ms = max(self.max_duration_ms, duration_ms)
 
     def status_snapshot(self) -> dict[str, Any]:
+        completed_span_ns = self.last_completed_ns - self.first_completed_ns
+        effective_hz = (
+            (self.completed - 1) * 1e9 / completed_span_ns
+            if self.completed > 1 and completed_span_ns > 0
+            else 0.0
+        )
         return {
+            "max_hz": self.max_hz,
+            "effective_hz": round(effective_hz, 3),
             "submitted": self.submitted,
             "completed": self.completed,
             "failed": self.failed,
             "dropped": self.dropped,
+            "coalesced": self.coalesced,
             "last_duration_ms": round(self.last_duration_ms, 3),
             "max_duration_ms": round(self.max_duration_ms, 3),
             "last_error": self.last_error,
@@ -542,10 +591,12 @@ class DualPiperAerohand:
                     self.workers[f"arm_{side}"] = LatestCommandWorker(
                         f"piper-{side}",
                         lambda value, s=side: self._send_arm(s, value),
+                        max_hz=float(self.cfg.get("arm_command_hz", 30.0)),
                     )
                     self.workers[f"hand_{side}"] = LatestCommandWorker(
                         f"aerohand-{side}",
                         lambda value, s=side: self._send_hand(s, value),
+                        max_hz=float(self.cfg.get("hand_command_hz", 60.0)),
                     )
                 self.state = "active"
                 # 准备状态只允许消费一次；下一个 episode 必须重新回 home_pose。

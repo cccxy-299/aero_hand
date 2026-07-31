@@ -83,6 +83,10 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpRe
                 np.asarray(cfg["robot"][side]["initial_pose"], np.float32),
                 float(cfg["robot"][side].get("vive_scale", 0.6)),
                 np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
+                np.asarray(
+                    cfg["robot"][side]["vive_to_robot_matrix"],
+                    np.float32,
+                ),
             )
             for side in ("left", "right")
         })

@@ -165,6 +165,10 @@ def _make_episode_control_components(
                     initial_poses[side],
                     float(cfg["robot"][side].get("vive_scale", 0.6)),
                     orientations[side],
+                    np.asarray(
+                        cfg["robot"][side]["vive_to_robot_matrix"],
+                        dtype=np.float32,
+                    ),
                 )
                 for side in SIDES
             }
@@ -617,6 +621,9 @@ def _control_process(
                     ),
                     teleop_reference=getattr(
                         retargeter, "reference_snapshot", lambda: {}
+                    )(),
+                    teleop_mapping=getattr(
+                        retargeter, "mapping_snapshot", lambda: {}
                     )(),
                 )
                 last_report_ns = now_ns

@@ -41,6 +41,10 @@ episode:
 robot:
   enabled: true
   hand_dof: 7
+  # 安全计算仍为100Hz；真实硬件线程只消费最新目标并独立限频，避免双臂
+  # move_p 高频发送与 USB 腕部相机/USB-CAN 适配器争抢主机资源。
+  arm_command_hz: 30
+  hand_command_hz: 60
   # 必须先在终端显式执行 home 并成功，之后才允许 start episode。
   require_home_before_start: true
   worker_stop_timeout_s: 3
@@ -63,6 +67,12 @@ robot:
     home_joint_tolerance_rad: 0.10
     hand_home_wait_s: 8
     vive_scale: 0.5
+    # 当前 pysurvive 真机标定：修正旧公式中 VIVE Y 被映射到 Piper Z 的问题。
+    # robot_delta = vive_to_robot_matrix @ vive_delta * vive_scale
+    vive_to_robot_matrix:
+      - [0, 0, -1]
+      - [0, 1, 0]
+      - [-1, 0, 0]
     initial_pose: [0, 0, 0, 0,0,0]
     # start 时锁定真实法兰姿态，episode 内仅由 VIVE 控制位置，避免首帧姿态跳变。
     orientation_mode: "current_on_start"
@@ -88,6 +98,10 @@ robot:
     home_joint_tolerance_rad: 0.10
     hand_home_wait_s: 8
     vive_scale: 0.5
+    vive_to_robot_matrix:
+      - [0, 0, -1]
+      - [0, 1, 0]
+      - [-1, 0, 0]
     initial_pose: [0, 0, 0, 0,0,0]
     orientation_mode: "current_on_start"
     # 仅当 orientation_mode=configured_fixed 时使用。

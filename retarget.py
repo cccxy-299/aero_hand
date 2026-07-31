@@ -36,6 +36,7 @@ class SideRetargetConfig:
     initial_pose: np.ndarray
     scale: float
     fixed_orientation: np.ndarray
+    position_map: np.ndarray
 
 
 class HardwareBimanualRetargeter:
@@ -49,6 +50,7 @@ class HardwareBimanualRetargeter:
         self.sides = sides
         self._vive_reference: dict[str, np.ndarray] = {}
         self._reference_source_seq: int | None = None
+        self._last_mapping: dict[str, dict[str, list[float]]] = {}
 
     @property
     def references_ready(self) -> bool:
@@ -64,6 +66,15 @@ class HardwareBimanualRetargeter:
     def reference_source_seq(self) -> int | None:
         return self._reference_source_seq
 
+    def mapping_snapshot(self) -> dict[str, dict[str, list[float]]]:
+        return {
+            side: {
+                name: list(values)
+                for name, values in snapshot.items()
+            }
+            for side, snapshot in self._last_mapping.items()
+        }
+
     def _vive_to_arm(self, side: str, vive_pose: list[float]) -> np.ndarray:
         pose = np.asarray(vive_pose, dtype=np.float32)
         if pose.shape != (7,) or not np.all(np.isfinite(pose)):
@@ -72,12 +83,13 @@ class HardwareBimanualRetargeter:
         if side not in self._vive_reference:
             raise RuntimeError(f"{side} VIVE 相对位置参考尚未建立")
         delta = pose[:3] - self._vive_reference[side]
-        # 与已验证的旧工程保持一致：
-        # SteamVR(x右/y上/z后) -> Piper(x前/y左/z上)
-        # drx=-dvz*scale, dry=-dvx*scale, drz=dvy*scale。
-        robot_delta = np.array(
-            [-delta[2], -delta[0], delta[1]], dtype=np.float32
-        ) * cfg.scale
+        # pysurvive 与旧 OpenVR demo 的世界坐标定义/标定方向并不保证一致，
+        # 因此轴交换和符号必须由真机标定矩阵显式给出，不能继续硬编码。
+        robot_delta = (cfg.position_map @ delta) * cfg.scale
+        self._last_mapping[side] = {
+            "vive_delta_xyz": delta.tolist(),
+            "robot_delta_xyz": robot_delta.tolist(),
+        }
         result = cfg.initial_pose.copy()
         result[:3] += robot_delta
         result[3:] = cfg.fixed_orientation

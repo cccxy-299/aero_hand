@@ -72,6 +72,43 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
                 raise ValueError(f"robot.{side}.{name} 必须包含 3 个值")
             if not all(math.isfinite(float(item)) for item in value):
                 raise ValueError(f"robot.{side}.{name} 必须全部为有限值")
+        position_map = side_cfg.get("vive_to_robot_matrix")
+        if (
+            not isinstance(position_map, list)
+            or len(position_map) != 3
+            or any(not isinstance(row, list) or len(row) != 3 for row in position_map)
+        ):
+            raise ValueError(
+                f"robot.{side}.vive_to_robot_matrix 必须是3x3矩阵"
+            )
+        matrix = [[float(item) for item in row] for row in position_map]
+        if not all(math.isfinite(item) for row in matrix for item in row):
+            raise ValueError(
+                f"robot.{side}.vive_to_robot_matrix 必须全部为有限值"
+            )
+        # 当前只接受轴交换/翻转矩阵，避免配置意外放大或耦合位移。
+        absolute = [[abs(item) for item in row] for row in matrix]
+        if any(
+            sum(math.isclose(item, 1.0, abs_tol=1e-6) for item in row) != 1
+            or any(
+                not (
+                    math.isclose(item, 0.0, abs_tol=1e-6)
+                    or math.isclose(item, 1.0, abs_tol=1e-6)
+                )
+                for item in row
+            )
+            for row in absolute
+        ) or any(
+            sum(
+                math.isclose(absolute[row][column], 1.0, abs_tol=1e-6)
+                for row in range(3)
+            )
+            != 1
+            for column in range(3)
+        ):
+            raise ValueError(
+                f"robot.{side}.vive_to_robot_matrix 必须是有效的轴交换/翻转矩阵"
+            )
         orientation_mode = str(
             side_cfg.get("orientation_mode", "current_on_start")
         ).lower()
@@ -189,6 +226,12 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         )
     for name in ("worker_stop_timeout_s", "state_stop_timeout_s"):
         if float(cfg["robot"].get(name, 3)) <= 0:
+            raise ValueError(f"robot.{name} must be positive")
+    for name, default in (
+        ("arm_command_hz", 30),
+        ("hand_command_hz", 60),
+    ):
+        if float(cfg["robot"].get(name, default)) <= 0:
             raise ValueError(f"robot.{name} must be positive")
     for name, default in (("min_frames", 10), ("command_queue_capacity", 32)):
         if int(episode.get(name, default)) <= 0:
