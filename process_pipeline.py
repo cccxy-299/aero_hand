@@ -430,32 +430,38 @@ def _make_cameras(cfg: dict[str, Any]) -> dict[str, Any]:
     return {name: _make_camera(cfg, name) for name in CAMERA_NAMES}
 
 
-def _camera_capture_process(
+def _camera_service_process(
     cfg: dict[str, Any],
     name: str,
     shm_name: str,
     image_shape: tuple[int, int, int],
     frame_seq: Any,
     frame_stamp_ns: Any,
+    frame_phase: Any,
     frame_lock: Any,
-    session_stop: Any,
+    stop_event: Any,
+    session_active: Any,
+    session_id: Any,
     camera_status_queue: Any,
 ) -> None:
-    """一路相机一个 OS 进程，通过共享内存发布最新 RGB 帧。
+    """长期驻留的一路相机服务，通过共享内存发布最新 RGB 帧。
 
-    图像不经过 multiprocessing.Queue/pickle；recorder 每个组帧周期只复制
-    当前最新帧，因此 V4L2/相机 SDK、MJPEG 解码和 USB 阻塞均不会阻塞组帧线程。
+    服务进程由设备 B 主进程直接创建，与 recorder/control 为同级进程。idle 时
+    不打开相机，只等待 ``session_active``；episode start 后连接并持续取流，stop
+    后释放设备并等待下一次 start。
     """
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s %(levelname)s [device-b/camera-{name}] %(message)s",
     )
-    _configure_child_signals(session_stop)
+    _configure_child_signals(stop_event)
     shm = shared_memory.SharedMemory(name=shm_name)
     image_view = np.ndarray(image_shape, dtype=np.uint8, buffer=shm.buf)
-    camera = None
     episode_cfg = cfg.get("episode", {})
     camera_cfg = cfg.get("cameras", {}).get(name, {})
+    startup_delay_ms = max(
+        0.0, float(camera_cfg.get("startup_delay_ms", 0.0))
+    )
     failure_timeout_ms = float(
         camera_cfg.get(
             "failure_timeout_ms",
@@ -474,20 +480,15 @@ def _camera_capture_process(
             episode_cfg.get("camera_error_report_interval", 30),
         )
     ))
-    published_frames = 0
-    total_frame_errors = 0
-    consecutive_frame_errors = 0
-    frame_errors_by_reason: dict[str, int] = {}
-    last_valid_ns = time.perf_counter_ns()
-    last_error_report_ns = 0
-    outage_reported = False
+    active_session = 0
 
-    def report(kind: str, **values: Any) -> None:
+    def report(kind: str, *, session: int, **values: Any) -> None:
         try:
             camera_status_queue.put_nowait(
                 {
                     "camera": name,
                     "kind": kind,
+                    "session": session,
                     "time_ns": time.perf_counter_ns(),
                     **values,
                 }
@@ -496,116 +497,169 @@ def _camera_capture_process(
             pass
 
     try:
-        camera = _make_camera(cfg, name)
-        camera.connect()
-        ready_reported = False
-        period_ns = int(1e9 / float(cfg["rates"]["camera_hz"]))
-        deadline_ns = time.perf_counter_ns()
-        while not session_stop.is_set():
-            try:
-                image, stamp_ns = camera.read()
-            except Exception as exc:
-                now_ns = time.perf_counter_ns()
-                total_frame_errors += 1
-                consecutive_frame_errors += 1
-                reason = str(getattr(exc, "reason", "read_error"))
-                frame_errors_by_reason[reason] = (
-                    frame_errors_by_reason.get(reason, 0) + 1
+        while not stop_event.is_set():
+            if not session_active.wait(0.2):
+                continue
+            if stop_event.is_set():
+                break
+
+            active_session = int(session_id.value)
+            # 左右腕和 RealSense 错峰启动，避免三个 USB/V4L2 后端同时初始化。
+            if startup_delay_ms > 0 and stop_event.wait(
+                startup_delay_ms / 1000.0
+            ):
+                break
+            if not session_active.is_set():
+                report(
+                    "stopped",
+                    session=active_session,
+                    published_frames=0,
+                    total_frame_errors=0,
+                    frame_errors_by_reason={},
                 )
-                last_valid_age_ms = (now_ns - last_valid_ns) / 1e6
-                should_report = (
-                    now_ns - last_error_report_ns >= 1_000_000_000
-                    or consecutive_frame_errors % report_interval == 0
-                )
-                if should_report:
-                    report(
-                        "frame_error",
-                        error=repr(exc),
-                        error_type=type(exc).__name__,
-                        reason=reason,
-                        reason_total=frame_errors_by_reason[reason],
-                        consecutive=consecutive_frame_errors,
-                        total=total_frame_errors,
-                        last_valid_age_ms=round(last_valid_age_ms, 3),
-                    )
-                    last_error_report_ns = now_ns
-                    outage_reported = True
-                if last_valid_age_ms >= failure_timeout_ms:
-                    raise RuntimeError(
-                        f"{name} 连续 {last_valid_age_ms:.1f}ms 没有有效图像，"
-                        f"超过阈值 {failure_timeout_ms:.1f}ms；"
-                        f"last_error={exc!r}"
-                    ) from exc
-                session_stop.wait(retry_delay_ms / 1000.0)
-                # 错误重试后重置节拍，避免恢复时追赶历史 deadline。
-                deadline_ns = time.perf_counter_ns()
                 continue
 
-            recovered_errors = consecutive_frame_errors
-            recovered_age_ms = (time.perf_counter_ns() - last_valid_ns) / 1e6
+            camera = None
+            published_frames = 0
+            total_frame_errors = 0
             consecutive_frame_errors = 0
-            image = np.asarray(image)
-            if image.shape != image_shape:
-                raise ValueError(
-                    f"{name} 图像尺寸错误: {image.shape}, 期望 {image_shape}"
-                )
-            if image.dtype != np.uint8:
-                image = image.astype(np.uint8, copy=False)
-            if not image.flags.c_contiguous:
-                image = np.ascontiguousarray(image)
-            with frame_lock:
-                image_view[:] = image
-                frame_stamp_ns.value = int(stamp_ns)
-                frame_seq.value += 1
-            published_frames += 1
+            frame_errors_by_reason: dict[str, int] = {}
             last_valid_ns = time.perf_counter_ns()
-            if recovered_errors and outage_reported:
-                report(
-                    "recovered",
-                    recovered_errors=recovered_errors,
-                    outage_ms=round(recovered_age_ms, 3),
-                    total=total_frame_errors,
-                )
+            last_error_report_ns = 0
             outage_reported = False
-            if not ready_reported:
-                # connect 成功还不够；至少发布一帧后才允许机器人开始控制。
-                describe = getattr(camera, "describe", None)
-                report(
-                    "ready",
-                    details=describe() if callable(describe) else {},
-                )
-                ready_reported = True
-
-            # 仿真相机读取不会阻塞；真实相机通常由硬件帧率自然限速。
-            deadline_ns += period_ns
-            remaining_ns = deadline_ns - time.perf_counter_ns()
-            if remaining_ns > 0:
-                session_stop.wait(remaining_ns / 1e9)
-            else:
-                deadline_ns = time.perf_counter_ns()
-    except BaseException as exc:
-        if not session_stop.is_set():
-            report(
-                "error",
-                error=repr(exc),
-                traceback=traceback.format_exc(),
-                published_frames=published_frames,
-                total_frame_errors=total_frame_errors,
-                frame_errors_by_reason=dict(frame_errors_by_reason),
-            )
-    finally:
-        if camera is not None:
             try:
-                camera.disconnect()
+                camera = _make_camera(cfg, name)
+                camera.connect()
+                ready_reported = False
+                while session_active.is_set() and not stop_event.is_set():
+                    try:
+                        # phase: 1=阻塞取帧，2=转换/发布，0=等待下一次取帧。
+                        frame_phase.value = 1
+                        image, stamp_ns = camera.read()
+                        frame_phase.value = 2
+                    except Exception as exc:
+                        frame_phase.value = 0
+                        now_ns = time.perf_counter_ns()
+                        total_frame_errors += 1
+                        consecutive_frame_errors += 1
+                        reason = str(getattr(exc, "reason", "read_error"))
+                        frame_errors_by_reason[reason] = (
+                            frame_errors_by_reason.get(reason, 0) + 1
+                        )
+                        last_valid_age_ms = (now_ns - last_valid_ns) / 1e6
+                        should_report = (
+                            now_ns - last_error_report_ns >= 1_000_000_000
+                            or consecutive_frame_errors % report_interval == 0
+                        )
+                        if should_report:
+                            report(
+                                "frame_error",
+                                session=active_session,
+                                error=repr(exc),
+                                error_type=type(exc).__name__,
+                                reason=reason,
+                                reason_total=frame_errors_by_reason[reason],
+                                consecutive=consecutive_frame_errors,
+                                total=total_frame_errors,
+                                last_valid_age_ms=round(last_valid_age_ms, 3),
+                            )
+                            last_error_report_ns = now_ns
+                            outage_reported = True
+                        if last_valid_age_ms >= failure_timeout_ms:
+                            raise RuntimeError(
+                                f"{name} 连续 {last_valid_age_ms:.1f}ms "
+                                f"没有有效图像，超过阈值 "
+                                f"{failure_timeout_ms:.1f}ms；"
+                                f"last_error={exc!r}"
+                            ) from exc
+                        stop_event.wait(retry_delay_ms / 1000.0)
+                        continue
+
+                    recovered_errors = consecutive_frame_errors
+                    recovered_age_ms = (
+                        time.perf_counter_ns() - last_valid_ns
+                    ) / 1e6
+                    consecutive_frame_errors = 0
+                    image = np.asarray(image)
+                    if image.shape != image_shape:
+                        raise ValueError(
+                            f"{name} 图像尺寸错误: {image.shape}, "
+                            f"期望 {image_shape}"
+                        )
+                    if image.dtype != np.uint8:
+                        image = image.astype(np.uint8, copy=False)
+                    if not image.flags.c_contiguous:
+                        image = np.ascontiguousarray(image)
+                    with frame_lock:
+                        image_view[:] = image
+                        frame_stamp_ns.value = int(stamp_ns)
+                        frame_seq.value += 1
+                    frame_phase.value = 0
+                    published_frames += 1
+                    last_valid_ns = time.perf_counter_ns()
+                    if recovered_errors and outage_reported:
+                        report(
+                            "recovered",
+                            session=active_session,
+                            recovered_errors=recovered_errors,
+                            outage_ms=round(recovered_age_ms, 3),
+                            total=total_frame_errors,
+                        )
+                    outage_reported = False
+                    if not ready_reported:
+                        describe = getattr(camera, "describe", None)
+                        report(
+                            "ready",
+                            session=active_session,
+                            details=(
+                                describe() if callable(describe) else {}
+                            ),
+                        )
+                        ready_reported = True
+                    # 真实相机由 V4L2/RealSense 帧到达自然限速，必须持续排空。
+                    # 仿真相机才需要显式等待，避免空转占满 CPU。
+                    if not bool(cfg["robot"]["enabled"]):
+                        stop_event.wait(
+                            1.0 / float(cfg["rates"]["camera_hz"])
+                        )
             except BaseException as exc:
-                report("disconnect_error", error=repr(exc))
+                frame_phase.value = 0
+                if not stop_event.is_set():
+                    report(
+                        "error",
+                        session=active_session,
+                        error=repr(exc),
+                        traceback=traceback.format_exc(),
+                        published_frames=published_frames,
+                        total_frame_errors=total_frame_errors,
+                        frame_errors_by_reason=dict(frame_errors_by_reason),
+                    )
+            finally:
+                frame_phase.value = 3
+                if camera is not None:
+                    try:
+                        camera.disconnect()
+                    except BaseException as exc:
+                        report(
+                            "disconnect_error",
+                            session=active_session,
+                            error=repr(exc),
+                        )
+                frame_phase.value = 0
+                report(
+                    "stopped",
+                    session=active_session,
+                    published_frames=published_frames,
+                    total_frame_errors=total_frame_errors,
+                    frame_errors_by_reason=dict(frame_errors_by_reason),
+                )
+            # error 后由 recorder 设置全局 stop；正常 stop 时等待 active 被清除，
+            # 避免在同一 episode 内立即重新打开设备。
+            while session_active.is_set() and not stop_event.is_set():
+                stop_event.wait(0.05)
+    finally:
+        frame_phase.value = 0
         shm.close()
-        report(
-            "stopped",
-            published_frames=published_frames,
-            total_frame_errors=total_frame_errors,
-            frame_errors_by_reason=dict(frame_errors_by_reason),
-        )
 
 
 def _build_frame(
@@ -671,8 +725,12 @@ def _recorder_process(
     sample_queue: Any,
     episode_queue: Any,
     status_queue: Any,
+    camera_channel_specs: dict[str, dict[str, Any]],
+    camera_status_queue: Any,
+    camera_session_active: Any,
+    camera_session_id: Any,
 ) -> None:
-    """记录进程：idle 不连接相机，recording 时轮询共享内存并写 episode。"""
+    """记录进程：控制相机 session，recording 时轮询共享内存并写 episode。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [device-b/recorder] %(message)s",
@@ -711,9 +769,14 @@ def _recorder_process(
         "discarded_episodes": 0,
     }
     worker_threads: list[threading.Thread] = []
-    camera_ctx = mp.get_context("spawn")
-    camera_channels: dict[str, dict[str, Any]] = {}
-    camera_status_queue: Any | None = None
+    camera_channels: dict[str, dict[str, Any]] = {
+        name: {
+            **spec,
+            "shm": shared_memory.SharedMemory(name=spec["shm_name"]),
+        }
+        for name, spec in camera_channel_specs.items()
+    }
+    active_camera_session = 0
     last_shared_camera_seq: dict[str, int] = {}
     writer = None
     writer_thread: threading.Thread | None = None
@@ -823,7 +886,7 @@ def _recorder_process(
             )
 
     def start_capture() -> None:
-        nonlocal camera_channels, camera_status_queue
+        nonlocal active_camera_session
         for buffer in buffers.values():
             buffer.clear()
         episode_diagnostics.clear()
@@ -833,42 +896,25 @@ def _recorder_process(
         camera_last_seq.clear()
         last_group_camera_seq.clear()
         last_shared_camera_seq.clear()
-        width = int(cfg["cameras"]["width"])
-        height = int(cfg["cameras"]["height"])
-        image_shape = (height, width, 3)
-        image_nbytes = int(np.prod(image_shape, dtype=np.int64))
-        camera_status_queue = camera_ctx.Queue(maxsize=32)
-        camera_channels = {}
-        try:
-            for name in CAMERA_NAMES:
-                shm = shared_memory.SharedMemory(create=True, size=image_nbytes)
-                channel = {
-                    "shm": shm,
-                    "shape": image_shape,
-                    "seq": camera_ctx.Value("q", -1),
-                    "stamp_ns": camera_ctx.Value("q", 0),
-                    "lock": camera_ctx.Lock(),
-                    "stop": camera_ctx.Event(),
-                }
-                process = camera_ctx.Process(
-                    name=f"device-b-camera-{name}",
-                    target=_camera_capture_process,
-                    args=(
-                        cfg,
-                        name,
-                        shm.name,
-                        image_shape,
-                        channel["seq"],
-                        channel["stamp_ns"],
-                        channel["lock"],
-                        channel["stop"],
-                        camera_status_queue,
-                    ),
-                )
-                channel["process"] = process
-                camera_channels[name] = channel
-                process.start()
 
+        # 清除上一会话晚到的状态，并重置共享帧元数据。相机服务进程始终由
+        # 设备 B 主进程持有，recorder 只通过 Event/Value 控制本次 session。
+        while True:
+            try:
+                camera_status_queue.get_nowait()
+            except queue.Empty:
+                break
+        for channel in camera_channels.values():
+            with channel["lock"]:
+                channel["seq"].value = -1
+                channel["stamp_ns"].value = 0
+            channel["phase"].value = 0
+        with camera_session_id.get_lock():
+            camera_session_id.value += 1
+            active_camera_session = int(camera_session_id.value)
+
+        try:
+            camera_session_active.set()
             # 只有三路相机全部 connect 成功后，才进入 recording 并启动机器人。
             ready: set[str] = set()
             deadline = time.monotonic() + float(
@@ -882,12 +928,8 @@ def _recorder_process(
                 try:
                     status = camera_status_queue.get(timeout=min(0.2, remaining))
                 except queue.Empty:
-                    for camera_name, channel in camera_channels.items():
-                        process = channel["process"]
-                        if process.exitcode is not None and camera_name not in ready:
-                            raise RuntimeError(
-                                f"{camera_name} 相机进程提前退出: {process.exitcode}"
-                            )
+                    continue
+                if int(status.get("session", -1)) != active_camera_session:
                     continue
                 if status["kind"] == "ready":
                     camera_name = str(status["camera"])
@@ -908,46 +950,43 @@ def _recorder_process(
                         f"{status['camera']} 相机启动失败: {status.get('error')}"
                     )
         except BaseException:
-            stop_capture()
+            stop_capture(require_stopped=False)
             raise
 
-    def stop_capture() -> None:
-        nonlocal camera_channels, camera_status_queue
-        for channel in camera_channels.values():
-            channel["stop"].set()
+    def stop_capture(*, require_stopped: bool = False) -> None:
+        nonlocal active_camera_session
+        if active_camera_session <= 0:
+            return
+        session = active_camera_session
+        camera_session_active.clear()
         join_timeout_s = float(
             episode_cfg.get("camera_shutdown_timeout_s", 5)
         )
-        for name, channel in camera_channels.items():
-            process = channel.get("process")
-            if process is None:
+        stopped: set[str] = set()
+        deadline = time.monotonic() + join_timeout_s
+        while stopped != set(CAMERA_NAMES):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                status = camera_status_queue.get(
+                    timeout=min(0.05, remaining)
+                )
+            except queue.Empty:
                 continue
-            process.join(timeout=join_timeout_s)
-            if process.is_alive():
-                LOG.warning("%s 相机进程未及时停止，发送 terminate", name)
-                process.terminate()
-                process.join(timeout=2)
-            if process.is_alive():
-                LOG.error("%s 相机后端无法退出，强制 kill", name)
-                process.kill()
-                process.join(timeout=2)
-        if camera_status_queue is not None:
-            status_drain_deadline = time.monotonic() + 0.2
-            while True:
-                try:
-                    remaining = status_drain_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    status = camera_status_queue.get(timeout=min(0.02, remaining))
-                except queue.Empty:
-                    continue
-                record_camera_status(status)
-                if status.get("kind") == "disconnect_error":
-                    LOG.warning(
-                        "%s 相机断开异常: %s",
-                        status.get("camera"),
-                        status.get("error"),
-                    )
+            if int(status.get("session", -1)) != session:
+                continue
+            record_camera_status(status)
+            if status.get("kind") == "stopped":
+                stopped.add(str(status.get("camera")))
+            elif status.get("kind") == "disconnect_error":
+                LOG.warning(
+                    "%s 相机断开异常: %s",
+                    status.get("camera"),
+                    status.get("error"),
+                )
+
+        missing_stopped = sorted(set(CAMERA_NAMES) - stopped)
         for name in CAMERA_NAMES:
             source_frames = (
                 camera_last_seq.get(name, -1) - camera_first_seq.get(name, 0) + 1
@@ -978,56 +1017,42 @@ def _recorder_process(
             episode_diagnostics[f"camera_error_ratio_{name}"] = round(
                 error_ratio, 4
             )
-        for name, channel in camera_channels.items():
-            try:
-                channel["shm"].close()
-                channel["shm"].unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                LOG.exception("%s 共享内存清理失败", name)
-            process = channel.get("process")
-            if process is not None:
-                try:
-                    process.close()
-                except ValueError:
-                    pass
-        camera_channels = {}
-        if camera_status_queue is not None:
-            camera_status_queue.close()
-            camera_status_queue.cancel_join_thread()
-            camera_status_queue = None
+        active_camera_session = 0
+        if missing_stopped:
+            message = (
+                f"相机服务未在 {join_timeout_s:.1f}s 内结束 session "
+                f"{session}: {missing_stopped}"
+            )
+            if require_stopped:
+                raise RuntimeError(message)
+            LOG.warning(message)
 
     def poll_camera_processes() -> None:
         """把共享内存中的新帧复制到 recorder 的时间缓冲区。"""
-        if camera_status_queue is not None:
-            while True:
-                try:
-                    status = camera_status_queue.get_nowait()
-                except queue.Empty:
-                    break
-                record_camera_status(status)
-                if status["kind"] == "error":
-                    raise RuntimeError(
-                        f"{status['camera']} 相机采集失败: {status.get('error')}；"
-                        f"frame_errors={status.get('frame_errors_by_reason', {})}"
-                    )
-                if status["kind"] == "disconnect_error":
-                    LOG.warning(
-                        "%s 相机断开异常: %s",
-                        status["camera"],
-                        status.get("error"),
-                    )
-                if status["kind"] == "stopped" and episode_state == "recording":
-                    raise RuntimeError(f"{status['camera']} 相机进程意外停止")
+        while True:
+            try:
+                status = camera_status_queue.get_nowait()
+            except queue.Empty:
+                break
+            if int(status.get("session", -1)) != active_camera_session:
+                continue
+            record_camera_status(status)
+            if status["kind"] == "error":
+                raise RuntimeError(
+                    f"{status['camera']} 相机采集失败: {status.get('error')}；"
+                    f"frame_errors={status.get('frame_errors_by_reason', {})}"
+                )
+            if status["kind"] == "disconnect_error":
+                LOG.warning(
+                    "%s 相机断开异常: %s",
+                    status["camera"],
+                    status.get("error"),
+                )
+            if status["kind"] == "stopped" and episode_state == "recording":
+                raise RuntimeError(f"{status['camera']} 相机服务意外停止")
 
         now_ns = time.perf_counter_ns()
         for name, channel in camera_channels.items():
-            process = channel["process"]
-            if process.exitcode is not None and episode_state == "recording":
-                raise RuntimeError(
-                    f"{name} 相机进程意外退出: exitcode={process.exitcode}"
-                )
             with channel["lock"]:
                 seq = int(channel["seq"].value)
                 stamp_ns = int(channel["stamp_ns"].value)
@@ -1058,13 +1083,23 @@ def _recorder_process(
                 )
                 frame_age_ms = (now_ns - stamp_ns) / 1e6
                 if frame_age_ms >= stall_timeout_ms:
+                    phase = int(channel["phase"].value)
+                    phase_name = {
+                        0: "idle",
+                        1: "read",
+                        2: "publish",
+                        3: "disconnect",
+                    }.get(phase, f"unknown({phase})")
                     episode_diagnostics[
                         f"camera_stall_age_ms_{name}"
                     ] = round(frame_age_ms, 3)
+                    episode_diagnostics[
+                        f"camera_stall_phase_{name}"
+                    ] = phase_name
                     raise RuntimeError(
                         f"{name} 相机共享帧已停滞 {frame_age_ms:.1f}ms，"
                         f"超过阈值 {stall_timeout_ms:.1f}ms；"
-                        "相机子进程可能阻塞在 VideoCapture.read()"
+                        f"相机服务阶段={phase_name}"
                     )
 
             if not is_new or image is None:
@@ -1121,7 +1156,7 @@ def _recorder_process(
             )
             return
         episode_state = "stopping"
-        stop_capture()
+        stop_capture(require_stopped=not stop_event.is_set())
         quality_failures: list[str] = []
         for name in CAMERA_NAMES:
             unique = int(episode_diagnostics.get(f"unique_used_{name}", 0))
@@ -1363,11 +1398,32 @@ def _recorder_process(
 
             now_ns = time.perf_counter_ns()
             if now_ns - last_report_ns >= 1_000_000_000:
+                camera_runtime: dict[str, Any] = {}
+                for name, channel in camera_channels.items():
+                    with channel["lock"]:
+                        seq = int(channel["seq"].value)
+                        stamp_ns = int(channel["stamp_ns"].value)
+                    phase = int(channel["phase"].value)
+                    camera_runtime[name] = {
+                        "seq": seq,
+                        "last_frame_age_ms": (
+                            round((now_ns - stamp_ns) / 1e6, 3)
+                            if stamp_ns > 0
+                            else None
+                        ),
+                        "phase": {
+                            0: "idle",
+                            1: "read",
+                            2: "publish",
+                            3: "disconnect",
+                        }.get(phase, f"unknown({phase})"),
+                    }
                 _status_put(
                     status_queue,
                     "recorder",
                     "metrics",
                     metrics=dict(metrics),
+                    cameras=camera_runtime,
                     episode_state=episode_state,
                     episode_frames=episode_frames,
                 )
@@ -1421,7 +1477,12 @@ def _recorder_process(
             except BaseException as exc:
                 fail("dataset_finalize", exc)
 
-        stop_capture()
+        stop_capture(require_stopped=False)
+        for name, channel in camera_channels.items():
+            try:
+                channel["shm"].close()
+            except Exception:
+                LOG.exception("%s recorder共享内存句柄关闭失败", name)
         _status_put(
             status_queue,
             "recorder",
@@ -1445,11 +1506,46 @@ def run_robot_multiprocess(
     episode_queue = ctx.Queue(maxsize=int(episode_cfg.get("command_queue_capacity", 32)))
     control_queue = ctx.Queue(maxsize=int(episode_cfg.get("command_queue_capacity", 32)))
     status_queue = ctx.Queue(maxsize=int(runtime_cfg.get("status_queue_capacity", 128)))
+    camera_status_queue = ctx.Queue(
+        maxsize=int(runtime_cfg.get("status_queue_capacity", 128))
+    )
+    camera_session_active = ctx.Event()
+    camera_session_id = ctx.Value("q", 0)
+    image_shape = (
+        int(cfg["cameras"]["height"]),
+        int(cfg["cameras"]["width"]),
+        3,
+    )
+    image_nbytes = int(np.prod(image_shape, dtype=np.int64))
+    camera_shms: dict[str, Any] = {}
+    camera_channel_specs: dict[str, dict[str, Any]] = {}
+    for name in CAMERA_NAMES:
+        shm = shared_memory.SharedMemory(create=True, size=image_nbytes)
+        camera_shms[name] = shm
+        camera_channel_specs[name] = {
+            "shm_name": shm.name,
+            "shape": image_shape,
+            "seq": ctx.Value("q", -1),
+            "stamp_ns": ctx.Value("q", 0),
+            "phase": ctx.Value("i", 0),
+            "lock": ctx.Lock(),
+        }
+
     processes = {
         "recorder": ctx.Process(
             name="device-b-recorder",
             target=_recorder_process,
-            args=(cfg, stop_event, sample_queue, episode_queue, status_queue),
+            args=(
+                cfg,
+                stop_event,
+                sample_queue,
+                episode_queue,
+                status_queue,
+                camera_channel_specs,
+                camera_status_queue,
+                camera_session_active,
+                camera_session_id,
+            ),
         ),
         "control": ctx.Process(
             name="device-b-control",
@@ -1457,6 +1553,26 @@ def run_robot_multiprocess(
             args=(cfg, stop_event, sample_queue, control_queue, status_queue),
         ),
     }
+    for name in CAMERA_NAMES:
+        channel = camera_channel_specs[name]
+        processes[f"camera_{name}"] = ctx.Process(
+            name=f"device-b-camera-{name}",
+            target=_camera_service_process,
+            args=(
+                cfg,
+                name,
+                channel["shm_name"],
+                channel["shape"],
+                channel["seq"],
+                channel["stamp_ns"],
+                channel["phase"],
+                channel["lock"],
+                stop_event,
+                camera_session_active,
+                camera_session_id,
+                camera_status_queue,
+            ),
+        )
     errors: list[dict[str, Any]] = []
     desired_active = bool(episode_cfg.get("auto_start", False))
 
@@ -1503,6 +1619,9 @@ def run_robot_multiprocess(
     old_sigterm = signal.signal(signal.SIGTERM, request_stop)
     console_thread: threading.Thread | None = None
     try:
+        # 相机服务先启动，但在 session_active 置位前不会连接或采集硬件。
+        for name in CAMERA_NAMES:
+            processes[f"camera_{name}"].start()
         processes["recorder"].start()
         processes["control"].start()
         if bool(episode_cfg.get("interactive", True)):
@@ -1570,6 +1689,7 @@ def run_robot_multiprocess(
                     )
                     stop_event.set()
     finally:
+        camera_session_active.clear()
         stop_event.set()
         shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
         # recorder 可能正在编码视频，给它更长的优雅退出时间。
@@ -1603,9 +1723,23 @@ def run_robot_multiprocess(
                     status.get("component", "runtime"),
                     status.get("error"),
                 )
-        for ipc_queue in (sample_queue, episode_queue, control_queue, status_queue):
+        for ipc_queue in (
+            sample_queue,
+            episode_queue,
+            control_queue,
+            status_queue,
+            camera_status_queue,
+        ):
             ipc_queue.close()
             ipc_queue.cancel_join_thread()
+        for name, shm in camera_shms.items():
+            try:
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOG.exception("%s 主进程共享内存清理失败", name)
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
 

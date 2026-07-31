@@ -26,7 +26,7 @@ episode:
   min_frames: 10
   save_on_shutdown: true
   command_queue_capacity: 32
-  # start 等待三路独立相机进程就绪；stop 超时后会强制回收卡死的相机进程。
+  # start 激活三路同级相机服务；idle 时服务进程存在但不会打开或采集相机。
   camera_start_timeout_s: 15
   camera_shutdown_timeout_s: 5
   # 瞬时空包/损坏帧只丢当前帧；持续无有效画面超过该时间才停止整个 episode。
@@ -77,6 +77,8 @@ cameras:
     driver: "opencv"
     # 真机实测节点；正式部署建议替换为 /dev/v4l/by-id/... 稳定路径。
     device: "/dev/video6"
+    # 三路相机错峰连接，避免 USB/V4L2/RealSense 同时初始化。
+    startup_delay_ms: 0
     backend: "v4l2"
     fourcc: "MJPG"
     fps: 30
@@ -92,6 +94,7 @@ cameras:
   wrist_right:
     driver: "opencv"
     device: "/dev/video8"
+    startup_delay_ms: 300
     backend: "v4l2"
     fourcc: "MJPG"
     fps: 30
@@ -105,6 +108,8 @@ cameras:
     failure_timeout_ms: 2500
   scene:
     driver: "realsense"
+    # 最后启动 RealSense，避免三路 USB 相机在同一时刻初始化。
+    startup_delay_ms: 600
     # 只有连接多台RealSense时才需要填写序列号；单台时可以留空。
     serial: ""
     fps: 30

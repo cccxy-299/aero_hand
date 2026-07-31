@@ -141,6 +141,10 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("episode.camera_error_report_interval must be positive")
     for camera in ("scene", "wrist_left", "wrist_right"):
         camera_cfg = cfg["cameras"][camera]
+        if float(camera_cfg.get("startup_delay_ms", 0)) < 0:
+            raise ValueError(
+                f"cameras.{camera}.startup_delay_ms must be non-negative"
+            )
         for name in ("timeout_ms", "failure_timeout_ms"):
             if name in camera_cfg and float(camera_cfg[name]) <= 0:
                 raise ValueError(f"cameras.{camera}.{name} must be positive")

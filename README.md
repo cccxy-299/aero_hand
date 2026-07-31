@@ -134,7 +134,10 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
         +-- wrist_right相机进程-> 一帧共享内存
 ```
 
-设备 B 固定使用 `spawn`，控制进程不会加载相机或 LeRobot 编码依赖。三路相机后端
+设备 B 固定使用 `spawn`，控制进程不会加载相机或 LeRobot 编码依赖。recorder、
+control 和三路相机服务均由设备 B 主进程直接创建，彼此为同级进程，不再由 recorder
+嵌套创建相机孙进程。idle 时相机服务只等待 session 事件，不打开相机；start 后按
+配置的 `startup_delay_ms` 错峰连接。三路相机后端
 和 MJPEG 解码各自在独立 OS 进程中运行，即使某个 C 扩展持有 Python GIL，也不会
 阻塞其他相机或 30 Hz 组帧循环。图像不经过 multiprocessing Queue/pickle，而是每路
 只发布一帧共享内存，记录进程按周期复制最新帧。原始图像不做跨进程序列化传输；
@@ -228,6 +231,8 @@ python opencv_camera_concurrency_test.py \
 会独立监控共享内存中的最新帧时间戳；超过 `failure_timeout_ms` 未更新时，即使相机
 子进程仍存活，也会判定 `VideoCapture.read()` 可能卡死并终止当前采集会话。stop
 阶段若子进程不能自行退出，会依次执行 `terminate` 和 `kill`，不会拖住控制进程。
+recorder 的每秒 `metrics.cameras` 还会输出各路 `seq`、`last_frame_age_ms` 和
+`phase`，用于区分阻塞发生在 `read`、共享内存发布还是设备释放阶段。
 
 ## Intel RealSense 全景相机
 
