@@ -228,6 +228,56 @@ python camera_concurrency_test.py \
 默认持续取流正常但 `--poll-hz 30` 失败，说明SDK需要持续排空，正式相机进程不应额外
 限频；只有部分 format 稳定时，应在 `robot.yaml` 固定各自已验证的索引。
 
+## 纯 OpenCV 双腕相机测试
+
+`opencv_camera.py` 是不依赖 `pyvizionsdk` 的同步相机类；
+`opencv_camera_concurrency_test.py` 是独立测试程序。它们当前没有接入
+`hardware_adapters.py` 或主 pipeline。
+
+先在 Linux 上确认设备节点和相机支持的格式：
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/video0 --list-formats-ext
+v4l2-ctl -d /dev/video2 --list-formats-ext
+ls -l /dev/v4l/by-id/
+```
+
+默认测试 `/dev/video0` 和 `/dev/video2`，以 `640x480 MJPG 30 FPS` 打开：
+
+```bash
+# 两只相机分别运行60秒
+python opencv_camera_concurrency_test.py --mode single-left --duration-s 60
+python opencv_camera_concurrency_test.py --mode single-right --duration-s 60
+
+# 单进程、每只相机一个采集线程
+python opencv_camera_concurrency_test.py --mode dual-thread --duration-s 60
+
+# 每只相机一个独立 spawn 子进程
+python opencv_camera_concurrency_test.py --mode dual-process --duration-s 60
+```
+
+设备节点不同时显式传入；正式配置建议使用 `/dev/v4l/by-id/...` 稳定路径：
+
+```bash
+python opencv_camera_concurrency_test.py \
+  --mode dual-process \
+  --left-device /dev/video0 \
+  --right-device /dev/video2 \
+  --width 640 \
+  --height 480 \
+  --fps 30 \
+  --fourcc MJPG \
+  --duration-s 120
+```
+
+每秒会输出 JSON `progress`，结束时输出 `summary` 和 `verdict`。重点检查
+`actual_properties` 中实际生效的 FourCC、分辨率和 FPS，以及 `source_fps`、
+`error_ratio`、`max_gap_ms`、`last_frame_age_ms` 和 `unique_ratio`。如果线程模式
+正常而进程模式异常，优先采用单相机进程内双线程；如果两种并发模式都正常，可优先
+采用双进程隔离。若实际分辨率不符合要求，程序默认直接报错；调试其他模式时可临时加
+`--no-strict-resolution`。
+
 ## Intel RealSense 全景相机
 
 设备 B 的 `cameras.scene` 使用 `driver: realsense`。单台 RealSense 时可将
