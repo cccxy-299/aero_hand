@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""设备A：仅采集双 VIVE Tracker，并通过 ZMQ PUSH 发送。"""
+"""设备 A：采集双 VIVE Tracker，通过 ZMQ PUSH 发送，并可选实时可视化。"""
 
 import argparse
 import logging
@@ -31,9 +31,9 @@ def _load(path: str) -> dict[str, Any]:
     return cfg
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="设备A：双 VIVE Tracker -> ZMQ 测试发送端"
+        description="设备 A：双 VIVE Tracker -> ZMQ 测试发送端"
     )
     parser.add_argument(
         "--config",
@@ -42,46 +42,55 @@ def main() -> None:
     parser.add_argument(
         "--endpoint",
         default=None,
-        help="默认 tcp://<operator.yaml中的robot_host>:17861",
+        help="默认 tcp://<operator.yaml 中的 robot_host>:17861",
     )
     parser.add_argument("--hz", type=float, default=None)
     parser.add_argument("--max-age-ms", type=float, default=100.0)
-    args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [vive-test/device-a] %(message)s",
+    visual_group = parser.add_mutually_exclusive_group()
+    visual_group.add_argument(
+        "--visualize",
+        dest="visualize",
+        action="store_true",
+        help="开启双 VIVE 三维可视化窗口",
     )
-    cfg = _load(args.config)
-    vive_cfg = cfg["operator"]["vive"]
-    endpoint = args.endpoint or (
-        f"tcp://{cfg['network']['robot_host']}:17861"
+    visual_group.add_argument(
+        "--no-visualize",
+        dest="visualize",
+        action="store_false",
+        help="关闭可视化，适用于无桌面环境",
     )
-    hz = float(args.hz or cfg.get("rates", {}).get("operator_hz", 60.0))
-    if hz <= 0 or args.max_age_ms <= 0:
-        parser.error("--hz 和 --max-age-ms 必须大于0")
+    parser.set_defaults(visualize=None)
+    return parser
 
-    reader = DualViveReader(
-        {
-            "left": str(vive_cfg["left_tracker_name"]),
-            "right": str(vive_cfg["right_tracker_name"]),
-        },
-        vive_cfg.get("survive_args"),
+
+def _send_loop(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    reader: DualViveReader,
+    stop_event: threading.Event,
+) -> None:
+    """发送最新 VIVE 快照；该循环可安全地运行在 Qt 主线程之外。"""
+    vive_cfg = cfg["operator"]["vive"]
+    endpoint = args.endpoint or f"tcp://{cfg['network']['robot_host']}:17861"
+    hz = float(
+        args.hz
+        if args.hz is not None
+        else cfg.get("rates", {}).get("operator_hz", 60.0)
     )
+    period_ns = int(1e9 / hz)
+    max_age_ns = int(args.max_age_ms * 1e6)
+
     context = zmq.Context.instance()
     socket = context.socket(zmq.PUSH)
     socket.setsockopt(zmq.SNDHWM, 1)
     socket.setsockopt(zmq.LINGER, 0)
     socket.connect(endpoint)
-    stop_event = threading.Event()
-    old_sigint = signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-    old_sigterm = signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+
     seq = 0
     sent = 0
     dropped = 0
     last_report_ns = time.perf_counter_ns()
     deadline_ns = last_report_ns
-    period_ns = int(1e9 / hz)
-    max_age_ns = int(args.max_age_ms * 1e6)
     LOG.info(
         "ZMQ连接=%s，left=%s，right=%s，发送频率=%.1fHz",
         endpoint,
@@ -98,15 +107,16 @@ def main() -> None:
                 value = snapshot.get(side)
                 age_ns = now_ns - value[1] if value is not None else 2**63 - 1
                 pose = value[0] if value is not None else [0.0] * 7
-                valid_pose = (
-                    len(pose) == 7
-                    and all(math.isfinite(float(item)) for item in pose)
+                valid_pose = len(pose) == 7 and all(
+                    math.isfinite(float(item)) for item in pose
                 )
                 sides[side] = {
                     "vive_pose": pose,
                     "capture_mono_ns": int(value[1]) if value else 0,
                     "age_ms": round(age_ns / 1e6, 3) if value else None,
-                    "valid": bool(value is not None and age_ns <= max_age_ns and valid_pose),
+                    "valid": bool(
+                        value is not None and age_ns <= max_age_ns and valid_pose
+                    ),
                 }
             packet = {
                 "version": 1,
@@ -124,7 +134,8 @@ def main() -> None:
 
             if now_ns - last_report_ns >= 1_000_000_000:
                 LOG.info(
-                    "seq=%d sent=%d dropped=%d left_age_ms=%s right_age_ms=%s valid=%s",
+                    "seq=%d sent=%d dropped=%d left_age_ms=%s "
+                    "right_age_ms=%s valid=%s",
                     seq,
                     sent,
                     dropped,
@@ -133,21 +144,91 @@ def main() -> None:
                     sides["left"]["valid"] and sides["right"]["valid"],
                 )
                 last_report_ns = now_ns
+
             deadline_ns += period_ns
             remaining_ns = deadline_ns - time.perf_counter_ns()
             if remaining_ns > 0:
                 stop_event.wait(remaining_ns / 1e9)
             else:
+                # 落后一个周期后从当前时间重新计时，避免持续追赶并占满 CPU。
                 deadline_ns = time.perf_counter_ns()
     finally:
-        stop_event.set()
-        reader.close()
         socket.close(linger=0)
+        LOG.info("设备A测试发送端已停止：sent=%d dropped=%d", sent, dropped)
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [vive-test/device-a] %(message)s",
+    )
+    cfg = _load(args.config)
+    hz = float(
+        args.hz
+        if args.hz is not None
+        else cfg.get("rates", {}).get("operator_hz", 60.0)
+    )
+    if hz <= 0 or args.max_age_ms <= 0:
+        parser.error("--hz 和 --max-age-ms 必须大于0")
+    visualize = (
+        bool(cfg.get("visualization", {}).get("enabled", False))
+        if args.visualize is None
+        else bool(args.visualize)
+    )
+
+    vive_cfg = cfg["operator"]["vive"]
+    reader = DualViveReader(
+        {
+            "left": str(vive_cfg["left_tracker_name"]),
+            "right": str(vive_cfg["right_tracker_name"]),
+        },
+        vive_cfg.get("survive_args"),
+    )
+    stop_event = threading.Event()
+    old_sigint = signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    old_sigterm = signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    sender_thread: threading.Thread | None = None
+    worker_errors: list[BaseException] = []
+
+    try:
+        if not visualize:
+            _send_loop(cfg, args, reader, stop_event)
+            return
+
+        # Qt 事件循环必须位于主线程；ZMQ 发送只读取同一个 reader 的快照，
+        # 不会重复连接 libsurvive，也不会阻塞三维窗口刷新。
+        from visualization import ViveViewer
+
+        def run_sender() -> None:
+            try:
+                _send_loop(cfg, args, reader, stop_event)
+            except BaseException as exc:
+                worker_errors.append(exc)
+                stop_event.set()
+
+        sender_thread = threading.Thread(
+            target=run_sender,
+            name="vive-zmq-sender",
+            daemon=True,
+        )
+        sender_thread.start()
+        ViveViewer(cfg, reader, stop_event).run()
+    finally:
+        stop_event.set()
+        if sender_thread is not None:
+            sender_thread.join(timeout=3.0)
+        # 先让发送线程退出，再释放 VIVE reader，避免关闭期间仍在读取快照。
+        reader.close()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
-        LOG.info("设备A测试发送端已停止：sent=%d dropped=%d", sent, dropped)
+
+    if sender_thread is not None and sender_thread.is_alive():
+        raise RuntimeError("ZMQ 发送线程未能在 3 秒内停止")
+    if worker_errors:
+        raise worker_errors[0]
 
 
 if __name__ == "__main__":
     main()
-

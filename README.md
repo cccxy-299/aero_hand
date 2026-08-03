@@ -72,14 +72,21 @@ ZMQ 使用设备A `PUSH`、设备B `PULL`，`SNDHWM/RCVHWM=1` 且设备B启用
 这是控制方向/频率隔离测试，不写训练数据，也不做正式采集链路中的跨机单调时钟
 映射；设备B使用设备A上报的 Tracker 年龄和本机收包后年龄执行超时保护。
 
-设备 A 可选择开启或关闭 VIVE 三维可视化：
+VIVE 双臂测试发送端可选择开启或关闭三维可视化。可视化与 ZMQ 发送共享同一个
+`DualViveReader`，不会重复连接 VIVE：
 
 ```powershell
 # 命令行显式开启
-python operator_main.py --config cfg/operator.yaml --visualize
+python vive_dual_arm_operator_test.py `
+  --config cfg/operator.yaml `
+  --endpoint 'tcp://172.16.83.95:17861' `
+  --visualize
 
 # 显式关闭，适用于无桌面环境
-python operator_main.py --config cfg/operator.yaml --no-visualize
+python vive_dual_arm_operator_test.py `
+  --config cfg/operator.yaml `
+  --endpoint 'tcp://172.16.83.95:17861' `
+  --no-visualize
 ```
 
 未传参数时使用 `operator.yaml` 中的 `visualization.enabled`。开启可视化需要额外安装
@@ -89,6 +96,45 @@ MANUS 重定向、网络发送或机器人控制。
 ```powershell
 python -m pip install -r requirements-visualization.txt
 ```
+
+### VIVE 到 Piper 轴映射标定
+
+设备 B 的双臂测试入口提供无机械臂轴标定模式。该模式只绑定 ZMQ 并读取 Tracker，
+不会创建 Piper 硬件进程，也不会调用 `enable`、`home` 或 `move_p`。先启动设备 A 的
+`vive_dual_arm_operator_test.py`，再在设备 B 运行：
+
+```bash
+cd teleop_collect
+python vive_dual_arm_robot_test.py \
+  --config cfg/robot.yaml \
+  --bind 'tcp://*:17861' \
+  --calibrate-axes \
+  --calibration-output cfg/vive_axis_calibration.yaml
+```
+
+程序依次标定 left 和 right，并分别引导完成 `+X/-X/+Y/-Y/+Z/-Z` 六次移动。每次
+先在任意舒适起点保持静止并按 Enter，再沿提示的 **Piper 基坐标方向**移动约10cm、
+保持静止并再次按 Enter。端点不是取单帧，而是在默认0.6秒窗口内求均值；样本过少、
+抖动超过3mm或位移小于4cm时会要求重采。
+
+只标定一侧时可以使用：
+
+```bash
+python vive_dual_arm_robot_test.py --config cfg/robot.yaml \
+  --calibrate-axes --calibration-sides left
+```
+
+六个方向完成后，程序使用正交 Procrustes/Kabsch 拟合
+`robot_delta = vive_to_robot_matrix @ vive_delta`，输出每个方向的角误差、正反方向
+一致性、RMS/最大误差、正交误差、行列式、奇异值和建议的单位比例。默认任一方向
+误差超过20度或正反方向不一致超过25度时拒绝生成配置。输出文件若已存在，会添加
+时间戳，不覆盖以前的标定。
+
+生成文件中的 `robot.left/right.vive_to_robot_matrix` 可以在人工检查后合并进
+`cfg/robot.yaml`。轴标定不会擅自修改操作灵敏度，因此 `vive_scale` 保留原配置；
+`calibration.sides.<side>.estimated_unit_scale` 只作为“移动距离是否接近预期”的诊断。
+若结果 `contains_reflection: true`，该矩阵仍可用于当前位置增量映射，但后续增加姿态
+跟随时必须采用坐标基变换/矩阵共轭，不能直接将它当作普通旋转矩阵左乘姿态。
 
 当前入口使用本目录内的模块引用，因此请先进入 `teleop_collect` 目录，再运行设备 A、
 设备 B 或仿真入口。

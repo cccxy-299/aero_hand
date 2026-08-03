@@ -73,6 +73,22 @@ def _load_robot_test_config(path: str) -> dict[str, Any]:
     return cfg
 
 
+def _load_axis_calibration_config(path: str) -> dict[str, Any]:
+    """标定模式只读取现有增益，不校验或连接任何机械臂硬件字段。"""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("robot"), dict):
+        raise ValueError("标定配置必须包含 robot 对象")
+    for side in SIDES:
+        side_cfg = cfg["robot"].get(side)
+        if not isinstance(side_cfg, dict):
+            raise ValueError(f"标定配置缺少 robot.{side}")
+        scale = float(side_cfg.get("vive_scale", 0))
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"robot.{side}.vive_scale 必须大于0")
+    return cfg
+
+
 def _make_control(
     cfg: dict[str, Any],
     proxy: DualArmProcessProxy,
@@ -170,13 +186,127 @@ def main() -> None:
         help="测试缩放系数，默认0.10，确认方向后再逐步增大",
     )
     parser.add_argument("--max-source-age-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--calibrate-axes",
+        action="store_true",
+        help="进入无机械臂轴标定模式，只接收 ZMQ 并拟合左右坐标映射",
+    )
+    parser.add_argument(
+        "--calibration-sides",
+        choices=("both", "left", "right"),
+        default="both",
+        help="需要标定的 Tracker，默认左右依次标定",
+    )
+    parser.add_argument(
+        "--calibration-output",
+        default=str(
+            Path(__file__).resolve().parent
+            / "cfg"
+            / "vive_axis_calibration.yaml"
+        ),
+        help="标定 YAML 输出路径；若已存在会自动添加时间戳，不覆盖旧文件",
+    )
+    parser.add_argument(
+        "--calibration-distance-m",
+        type=float,
+        default=0.10,
+        help="每次引导移动的物理距离，默认0.10m",
+    )
+    parser.add_argument(
+        "--calibration-min-displacement-m",
+        type=float,
+        default=0.04,
+        help="单次有效移动的最小距离，默认0.04m",
+    )
+    parser.add_argument(
+        "--calibration-window-s",
+        type=float,
+        default=0.60,
+        help="每个静止端点的采样窗口，默认0.60s",
+    )
+    parser.add_argument(
+        "--calibration-min-samples",
+        type=int,
+        default=15,
+        help="每个静止端点最少有效样本数，默认15",
+    )
+    parser.add_argument(
+        "--calibration-max-std-m",
+        type=float,
+        default=0.003,
+        help="端点任一坐标允许的最大标准差，默认0.003m",
+    )
+    parser.add_argument(
+        "--calibration-max-fit-error-deg",
+        type=float,
+        default=20.0,
+        help="任一方向允许的最大拟合角误差，默认20度",
+    )
+    parser.add_argument(
+        "--calibration-max-pair-error-deg",
+        type=float,
+        default=25.0,
+        help="同一轴正反方向允许的最大不一致角度，默认25度",
+    )
     args = parser.parse_args()
-    if args.scale <= 0 or args.max_source_age_ms <= 0:
-        parser.error("--scale 和 --max-source-age-ms 必须大于0")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [vive-test/device-b] %(message)s",
     )
+
+    if args.max_source_age_ms <= 0:
+        parser.error("--max-source-age-ms 必须大于0")
+    if args.calibrate_axes:
+        calibration_values = (
+            args.calibration_distance_m,
+            args.calibration_min_displacement_m,
+            args.calibration_window_s,
+            args.calibration_max_std_m,
+            args.calibration_max_fit_error_deg,
+            args.calibration_max_pair_error_deg,
+        )
+        if any(value <= 0 for value in calibration_values):
+            parser.error("所有 calibration 数值参数必须大于0")
+        if args.calibration_min_samples < 3:
+            parser.error("--calibration-min-samples 必须至少为3")
+        if args.calibration_min_displacement_m >= args.calibration_distance_m:
+            parser.error(
+                "--calibration-min-displacement-m 必须小于 "
+                "--calibration-distance-m"
+            )
+        cfg = _load_axis_calibration_config(args.config)
+        selected_sides = (
+            SIDES
+            if args.calibration_sides == "both"
+            else (args.calibration_sides,)
+        )
+        from vive_axis_calibration import run_axis_calibration
+
+        try:
+            run_axis_calibration(
+                bind=args.bind,
+                validator=_validate_packet,
+                sides=selected_sides,
+                output_path=Path(args.calibration_output).expanduser().resolve(),
+                configured_scales={
+                    side: float(cfg["robot"][side]["vive_scale"])
+                    for side in selected_sides
+                },
+                max_source_age_ms=args.max_source_age_ms,
+                expected_distance_m=args.calibration_distance_m,
+                min_displacement_m=args.calibration_min_displacement_m,
+                window_s=args.calibration_window_s,
+                min_samples=args.calibration_min_samples,
+                max_std_m=args.calibration_max_std_m,
+                max_fit_error_deg=args.calibration_max_fit_error_deg,
+                max_pair_error_deg=args.calibration_max_pair_error_deg,
+            )
+        except KeyboardInterrupt:
+            LOG.warning("用户取消轴标定；未生成配置")
+        return
+
+    if args.scale <= 0:
+        parser.error("--scale 必须大于0")
     cfg = _load_robot_test_config(args.config)
 
     ctx = mp.get_context("spawn")
