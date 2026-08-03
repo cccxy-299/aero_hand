@@ -1,8 +1,11 @@
 # 设备 A：MANUS 在本机重定向为7维手指令；VIVE 保持原始位姿发送。
 network:
+  transport: "zmq"
   robot_host: "172.16.83.95"
   data_port: 17860
+  sync_port: 17862
   max_packet_bytes: 65507
+  startup_timeout_s: 5
 rates:
   operator_hz: 60
 operator:

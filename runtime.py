@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import threading
 import time
@@ -12,7 +13,7 @@ from adapters import SimCamera, SimOperator, SimRobot
 from clock import ClockMapper
 from dataset import feature_schema, make_writer
 from model import TimedSample
-from network import UdpReceiver, UdpSender
+from network import ZmqClockSynchronizer, ZmqReceiver, ZmqSender
 from pipeline import RobotPipeline
 from protocol import (
     Sequencer,
@@ -27,7 +28,10 @@ from retarget import (
 from safety import SafetyConfig, SafetyGate
 
 
-def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpReceiver | None]:
+LOG = logging.getLogger(__name__)
+
+
+def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, ZmqReceiver | None]:
     hand_dof = int(cfg["robot"]["hand_dof"])
     cameras = cfg["cameras"]
     schema = feature_schema(cameras["height"], cameras["width"], hand_dof)
@@ -112,8 +116,12 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, UdpRe
     )
     receiver = None
     if ingest_network:
-        receiver = UdpReceiver(
-            int(cfg["network"]["data_port"]), ClockMapper(), pipeline.ingest_teleop,
+        data_port = int(cfg["network"]["data_port"])
+        receiver = ZmqReceiver(
+            data_port,
+            int(cfg["network"].get("sync_port", data_port + 1)),
+            ClockMapper(),
+            pipeline.ingest_teleop,
             int(cfg["network"]["max_packet_bytes"]),
         )
     return pipeline, receiver
@@ -137,16 +145,26 @@ def operator(
         source = HardwareOperatorSource(cfg["operator"])
     elif source is None:
         source = SimOperator(hand_dof)
-    sender = UdpSender(cfg["network"]["robot_host"], int(cfg["network"]["data_port"]))
+    data_port = int(cfg["network"]["data_port"])
+    sender = ZmqSender(cfg["network"]["robot_host"], data_port)
+    synchronizer = ZmqClockSynchronizer(
+        cfg["network"]["robot_host"],
+        int(cfg["network"].get("sync_port", data_port + 1)),
+    )
     seq = Sequencer()
-    period = 1.0 / float(cfg["rates"]["operator_hz"])
-    next_sync = 0.0
+    period_ns = int(1e9 / float(cfg["rates"]["operator_hz"]))
+    deadline_ns = time.perf_counter_ns()
+    sync_thread = threading.Thread(
+        target=synchronizer.run,
+        args=(stop_event,),
+        name="operator-zmq-clock-sync",
+        daemon=True,
+    )
+    sync_thread.start()
     try:
         while not stop_event.is_set():
-            now = time.perf_counter()
-            if now >= next_sync:
-                sender.synchronize(seq.packet("sync_request", {}))
-                next_sync = now + 1.0
+            if synchronizer.error is not None:
+                raise RuntimeError("设备A ZMQ 时钟同步线程失败") from synchronizer.error
             if hardware_enabled:
                 payload = source.read_payload()
                 validate_hardware_command_payload(payload)
@@ -162,16 +180,35 @@ def operator(
                 }
                 validate_bimanual_payload(payload, hand_dof)
             sender.send(seq.packet("teleop", payload))
-            time.sleep(period)
+            deadline_ns += period_ns
+            remaining_ns = deadline_ns - time.perf_counter_ns()
+            if remaining_ns > 0:
+                stop_event.wait(remaining_ns / 1e9)
+            else:
+                deadline_ns = time.perf_counter_ns()
+        if synchronizer.error is not None:
+            raise RuntimeError(
+                "设备A ZMQ 时钟同步线程失败"
+            ) from synchronizer.error
     finally:
+        stop_event.set()
+        sync_thread.join(timeout=1.0)
         if hasattr(source, "close"):
             source.close()
         sender.close()
+        LOG.info(
+            "设备A ZMQ已停止：sent=%d dropped=%d sync_success=%d "
+            "sync_failures=%d",
+            sender.sent,
+            sender.dropped,
+            synchronizer.success,
+            synchronizer.failures,
+        )
 
 
 def run_robot(cfg: dict) -> None:
     # 真机入口固定使用 spawn 多进程。控制进程不会与图像编码、磁盘写入争用 GIL，
-    # 也不会继承父进程中预先打开的 UDP、CAN、串口或 USB 句柄。
+    # 也不会继承父进程中预先打开的 ZMQ、CAN、串口或 USB 句柄。
     from process_pipeline import run_robot_multiprocess
 
     run_robot_multiprocess(cfg)

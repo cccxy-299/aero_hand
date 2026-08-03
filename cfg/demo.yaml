@@ -1,7 +1,10 @@
 network:
+  transport: "zmq"
   robot_host: "127.0.0.1"
   data_port: 17860
+  sync_port: 17862
   max_packet_bytes: 65507
+  startup_timeout_s: 5
 rates:
   operator_hz: 60
   control_hz: 100

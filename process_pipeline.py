@@ -22,7 +22,7 @@ from model import (
     TeleopCommand,
     TimedSample,
 )
-from network import UdpReceiver
+from network import ZmqReceiver
 from retarget import HardwareBimanualRetargeter, PassthroughRetargeter, SideRetargetConfig
 from safety import SafetyConfig, SafetyGate
 
@@ -302,6 +302,15 @@ def _control_process(
                 reason="already_active",
             )
             return
+        if receiver is None or receiver.sync_updates < 1:
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command="start",
+                reason="zmq_clock_not_synchronized",
+            )
+            return
         if robot is None:
             _status_put(
                 status_queue,
@@ -440,6 +449,15 @@ def _control_process(
                     reason="episode_active",
                 )
                 return
+            if receiver is None or receiver.sync_updates < 1:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="prepare_start",
+                    reason="zmq_clock_not_synchronized",
+                )
+                return
             if robot is None:
                 _status_put(
                     status_queue,
@@ -524,6 +542,19 @@ def _control_process(
                 active=active,
                 metrics=dict(metrics),
                 hardware=robot.status_snapshot() if robot is not None else None,
+                network=(
+                    {
+                        "transport": "zmq",
+                        "data_endpoint": receiver.data_endpoint,
+                        "sync_endpoint": receiver.sync_endpoint,
+                        "bad_packets": receiver.bad_packets,
+                        "sequence_gaps": receiver.sequence_gaps,
+                        "sync_updates": receiver.sync_updates,
+                        "clock_offset_ns": receiver.mapper.offset_ns,
+                    }
+                    if receiver is not None
+                    else None
+                ),
             )
         else:
             _status_put(
@@ -546,22 +577,30 @@ def _control_process(
             hardware=robot.status_snapshot(),
         )
 
-        # 空闲态保留 UDP/时钟同步；4个硬件进程继续常驻并保持最后状态。
-        receiver = UdpReceiver(
-            int(cfg["network"]["data_port"]),
+        # 空闲态保留 ZMQ/时钟同步；4个硬件进程继续常驻并保持最后状态。
+        data_port = int(cfg["network"]["data_port"])
+        sync_port = int(cfg["network"].get("sync_port", data_port + 1))
+        receiver = ZmqReceiver(
+            data_port,
+            sync_port,
             ClockMapper(),
             ingest,
             int(cfg["network"]["max_packet_bytes"]),
         )
         receiver_thread = threading.Thread(
-            target=receiver.run, name="udp-receiver", daemon=True
+            target=receiver.run, name="zmq-receiver", daemon=True
         )
         receiver_thread.start()
+        receiver.wait_ready(
+            timeout_s=float(cfg.get("network", {}).get("startup_timeout_s", 5.0))
+        )
         _status_put(
             status_queue,
             "control",
             "ready",
-            udp_port=cfg["network"]["data_port"],
+            transport="zmq",
+            data_endpoint=receiver.data_endpoint,
+            sync_endpoint=receiver.sync_endpoint,
             active=False,
             hardware=robot.status_snapshot(),
         )
@@ -573,6 +612,8 @@ def _control_process(
         )
         deadline_ns = time.perf_counter_ns()
         while not stop_event.is_set():
+            if receiver.error is not None:
+                raise RuntimeError("ZMQ 接收线程异常退出") from receiver.error
             if not active:
                 try:
                     handle_command(control_queue.get(timeout=0.2))
@@ -676,6 +717,13 @@ def _control_process(
                     teleop_mapping=getattr(
                         retargeter, "mapping_snapshot", lambda: {}
                     )(),
+                    network={
+                        "transport": "zmq",
+                        "bad_packets": receiver.bad_packets,
+                        "sequence_gaps": receiver.sequence_gaps,
+                        "sync_updates": receiver.sync_updates,
+                        "clock_offset_ns": receiver.mapper.offset_ns,
+                    },
                 )
                 last_report_ns = now_ns
             deadline_ns += period_ns

@@ -5,8 +5,9 @@
 进程内只使用 `time.perf_counter_ns()`，禁止用墙上时间参与对齐。A 包含源单调时间；
 B 使用时钟映射后写入缓冲。帧时刻由 B 的绝对 deadline 驱动，并采用 causal
 sample-and-hold，避免选到“未来”样本。数据集中保存每种模态相对帧时刻的 lag 和
-valid。系统每 1 秒执行一次已接入 UDP 通道的四时间戳同步握手，`ClockMapper`
-选择低 RTT 样本的偏移中位数。
+valid。设备 A 使用独立的 ZMQ `REQ/REP` 线程每 1 秒执行一次四时间戳同步握手，
+`ClockMapper` 选择低 RTT 样本的偏移中位数；遥操作数据使用独立的
+`PUSH/PULL + CONFLATE` 最新值通道，同步超时不会阻塞 MANUS/VIVE 采集。
 
 ## 安全状态机
 

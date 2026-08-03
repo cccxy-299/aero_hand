@@ -7,6 +7,27 @@ from typing import Any
 import yaml
 
 
+def _validate_zmq_network(cfg: dict[str, Any], require_robot_host: bool) -> None:
+    network = cfg.get("network")
+    if not isinstance(network, dict):
+        raise ValueError("network 配置必须是对象")
+    if str(network.get("transport", "zmq")).lower() != "zmq":
+        raise ValueError("network.transport 必须为 zmq")
+    data_port = int(network.get("data_port", 0))
+    sync_port = int(network.get("sync_port", data_port + 1))
+    if not 1 <= data_port <= 65535 or not 1 <= sync_port <= 65535:
+        raise ValueError("network.data_port/sync_port 必须在 [1, 65535]")
+    if data_port == sync_port:
+        raise ValueError("network.data_port 与 sync_port 不能相同")
+    network["sync_port"] = sync_port
+    if int(network.get("max_packet_bytes", 65507)) <= 0:
+        raise ValueError("network.max_packet_bytes 必须大于0")
+    if float(network.get("startup_timeout_s", 5.0)) <= 0:
+        raise ValueError("network.startup_timeout_s 必须大于0")
+    if require_robot_host and not str(network.get("robot_host", "")).strip():
+        raise ValueError("network.robot_host 不能为空")
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
@@ -14,6 +35,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     missing = [key for key in required if key not in cfg]
     if missing:
         raise ValueError(f"missing config sections: {missing}")
+    _validate_zmq_network(cfg, require_robot_host=False)
     for name in ("operator_hz", "control_hz", "state_hz", "camera_hz", "frame_hz"):
         if float(cfg["rates"][name]) <= 0:
             raise ValueError(f"rates.{name} must be positive")
@@ -31,6 +53,7 @@ def load_operator_config(path: str | Path) -> dict[str, Any]:
     missing = [key for key in required if key not in cfg]
     if missing:
         raise ValueError(f"missing operator config sections: {missing}")
+    _validate_zmq_network(cfg, require_robot_host=True)
     if float(cfg["rates"]["operator_hz"]) <= 0:
         raise ValueError("rates.operator_hz must be positive")
     if int(cfg["operator"]["hand_dof"]) != 7:
@@ -53,6 +76,7 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     missing = [key for key in required if key not in cfg]
     if missing:
         raise ValueError(f"missing robot config sections: {missing}")
+    _validate_zmq_network(cfg, require_robot_host=False)
     for name in ("control_hz", "state_hz", "camera_hz", "frame_hz"):
         if float(cfg["rates"][name]) <= 0:
             raise ValueError(f"rates.{name} must be positive")
@@ -86,29 +110,38 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
             raise ValueError(
                 f"robot.{side}.vive_to_robot_matrix 必须全部为有限值"
             )
-        # 当前只接受轴交换/翻转矩阵，避免配置意外放大或耦合位移。
-        absolute = [[abs(item) for item in row] for row in matrix]
-        if any(
-            sum(math.isclose(item, 1.0, abs_tol=1e-6) for item in row) != 1
-            or any(
-                not (
-                    math.isclose(item, 0.0, abs_tol=1e-6)
-                    or math.isclose(item, 1.0, abs_tol=1e-6)
-                )
-                for item in row
-            )
-            for row in absolute
-        ) or any(
+        # 标定结果可以是任意正交坐标映射，而不只是0/±1轴交换矩阵。
+        # det=-1 表示坐标约定含镜像，对当前位置增量仍然有效。
+        gram = [
+            [
+                sum(matrix[k][i] * matrix[k][j] for k in range(3))
+                for j in range(3)
+            ]
+            for i in range(3)
+        ]
+        orthogonality_error = math.sqrt(
             sum(
-                math.isclose(absolute[row][column], 1.0, abs_tol=1e-6)
-                for row in range(3)
+                (gram[i][j] - (1.0 if i == j else 0.0)) ** 2
+                for i in range(3)
+                for j in range(3)
             )
-            != 1
-            for column in range(3)
-        ):
+        )
+        determinant = (
+            matrix[0][0]
+            * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+            - matrix[0][1]
+            * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+            + matrix[0][2]
+            * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+        )
+        if orthogonality_error > 1e-3 or abs(abs(determinant) - 1.0) > 1e-3:
             raise ValueError(
-                f"robot.{side}.vive_to_robot_matrix 必须是有效的轴交换/翻转矩阵"
+                f"robot.{side}.vive_to_robot_matrix 必须是正交坐标映射；"
+                f"orthogonality_error={orthogonality_error:.3e}, "
+                f"det={determinant:.6f}"
             )
+        if float(side_cfg.get("vive_scale", 0)) <= 0:
+            raise ValueError(f"robot.{side}.vive_scale 必须大于0")
         orientation_mode = str(
             side_cfg.get("orientation_mode", "current_on_start")
         ).lower()

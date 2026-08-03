@@ -33,6 +33,14 @@ cd teleop_collect
 python operator_main.py --config cfg/operator.yaml
 ```
 
+正式主链路使用 ZMQ：设备 A 通过 `PUSH` 非阻塞发送遥操作包到设备 B 的
+`tcp://*:17860`，设备 B 使用 `PULL + CONFLATE`，拥塞时只消费最新包；独立的
+`REQ/REP` 时钟同步通道使用端口 `17862`。设备 B 应先启动，且防火墙需要同时放行
+TCP 17860 和 17862。时钟同步运行在设备 A 的独立线程，不会阻塞 MANUS/VIVE
+采集及数据发送。设备 B 在 `sync_updates >= 1` 前会拒绝 `start`，避免尚未建立跨机
+单调时间映射时执行机器人或记录错误时间戳；可在设备 B 输入 `status` 查看
+`network.sync_updates`、`clock_offset_ns`、丢包间隙和坏包计数。
+
 ## 仅 VIVE 遥操作双臂的 ZMQ 测试
 
 该测试链路不创建 MANUS、Aerohand、相机、Recorder 或 LeRobot Writer，只验证
@@ -150,7 +158,7 @@ false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐�
 
 设备 B 启动时由父进程创建4个常驻硬件进程：`arm_left`、`arm_right`、
 `hand_left`、`hand_right`。每个进程独占一个 SDK 和硬件句柄；control 子进程只做
-UDP、重定向、安全计算及 IPC 协调。启动过程不会自动改变机械臂当前使能状态。
+ZMQ、重定向、安全计算及 IPC 协调。启动过程不会自动改变机械臂当前使能状态。
 三路相机仍保持关闭，控制循环也不会启动。在
 `robot_main` 所在终端输入：
 
@@ -233,10 +241,10 @@ LeRobot 0.4 使用其构造器续写。已有 fps 或 feature schema 与当前�
 ## 多进程与数据流
 
 ```text
-设备 A: 左右MANUS/VIVE采集 -> MANUS双手7维重定向 -> 同一seq/mono_ns -> UDP
+设备 A: 左右MANUS/VIVE采集 -> MANUS双手7维重定向 -> 同一seq/mono_ns -> ZMQ PUSH
 设备 B 父进程: 信号处理、子进程监督、统一退出
         |
-        +-- 控制进程: UDP/时钟映射 -> 100 Hz重定向/安全门 -> 双Piper/双Aerohand
+        +-- 控制进程: ZMQ PULL/时钟映射 -> 100 Hz重定向/安全门 -> 双Piper/双Aerohand
         |                                |
         |                        有界IPC（仅小型状态/动作）
         |                                |
