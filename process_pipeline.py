@@ -1409,7 +1409,6 @@ def _recorder_process(
             if status["kind"] == "stopped" and episode_state == "recording":
                 raise RuntimeError(f"{status['camera']} 相机服务意外停止")
 
-        now_ns = time.perf_counter_ns()
         for name, channel in camera_channels.items():
             with channel["lock"]:
                 seq = int(channel["seq"].value)
@@ -1428,6 +1427,11 @@ def _recorder_process(
                     else None
                 )
 
+            # 必须在读取共享时间戳之后再读取本机单调时钟。相机进程可能在
+            # recorder 进入本轮循环后发布新帧；若复用循环开始前的 now_ns，
+            # 就可能出现 now_ns < stamp_ns，从而得到负的帧年龄。
+            snapshot_ns = time.perf_counter_ns()
+
             # OpenCV V4L2 通常不接受 CAP_PROP_READ_TIMEOUT_MSEC。若子进程
             # 永久阻塞在 VideoCapture.read()，它仍然存活且不会报告异常，
             # 因此 recorder 必须根据共享帧时间戳独立检测停流。
@@ -1439,7 +1443,7 @@ def _recorder_process(
                         episode_cfg.get("camera_failure_timeout_ms", 1500),
                     )
                 )
-                frame_age_ms = (now_ns - stamp_ns) / 1e6
+                frame_age_ms = max(0.0, (snapshot_ns - stamp_ns) / 1e6)
                 if frame_age_ms >= stall_timeout_ms:
                     phase = int(channel["phase"].value)
                     phase_name = {
@@ -1761,11 +1765,14 @@ def _recorder_process(
                     with channel["lock"]:
                         seq = int(channel["seq"].value)
                         stamp_ns = int(channel["stamp_ns"].value)
+                    # 各相机共享时间戳读取完成后分别采样当前时间，避免相机
+                    # 在本轮 metrics 开始后更新 stamp_ns 而产生负的 age。
+                    snapshot_ns = time.perf_counter_ns()
                     phase = int(channel["phase"].value)
                     camera_runtime[name] = {
                         "seq": seq,
                         "last_frame_age_ms": (
-                            round((now_ns - stamp_ns) / 1e6, 3)
+                            round(max(0, snapshot_ns - stamp_ns) / 1e6, 3)
                             if stamp_ns > 0
                             else None
                         ),
