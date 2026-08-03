@@ -25,7 +25,7 @@ from retarget import (
     PassthroughRetargeter,
     SideRetargetConfig,
 )
-from safety import SafetyConfig, SafetyGate
+from safety import SafetyConfig, SafetyGate, effective_control_step_m
 
 
 LOG = logging.getLogger(__name__)
@@ -43,7 +43,11 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, ZmqRe
             SafetyConfig(
                 np.asarray(side_cfg["workspace_min"], np.float32),
                 np.asarray(side_cfg["workspace_max"], np.float32),
-                float(side_cfg["max_linear_step_m"]),
+                effective_control_step_m(
+                    float(side_cfg["max_linear_step_m"]),
+                    float(cfg["rates"]["control_hz"]),
+                    float(cfg["robot"].get("arm_command_hz", 30.0)),
+                ),
                 np.asarray(cfg["robot"]["hand_min"], np.float32),
                 np.asarray(cfg["robot"]["hand_max"], np.float32),
                 int(float(cfg["alignment"]["teleop_timeout_ms"]) * 1e6),

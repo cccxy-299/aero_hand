@@ -23,7 +23,7 @@ operator:
     left_tracker_name: "T21"
     right_tracker_name: "T22"
     #  --force-calibrate ： 重新标定，基站移动就需要加这个参数
-    survive_args: ['--v', '10','--force-calibrate ']
+    survive_args: ['--v', '10', '--force-calibrate']
 visualization:
   enabled: true
   window_title: "双侧 VIVE 遥操作可视化"

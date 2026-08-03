@@ -12,6 +12,17 @@ FLAG_RATE = 4
 FLAG_ESTOP = 8
 
 
+def effective_control_step_m(
+    configured_hardware_step_m: float,
+    control_hz: float,
+    arm_command_hz: float,
+) -> float:
+    """把每次硬件 move_p 步长换算为控制循环每 tick 的步长。"""
+    if configured_hardware_step_m <= 0 or control_hz <= 0 or arm_command_hz <= 0:
+        raise ValueError("步长、control_hz 和 arm_command_hz 必须为正数")
+    return configured_hardware_step_m * min(1.0, arm_command_hz / control_hz)
+
+
 @dataclass
 class SafetyConfig:
     workspace_min: np.ndarray
@@ -32,6 +43,17 @@ class SafetyGate:
     def __init__(self, cfg: SafetyConfig, initial_pose: np.ndarray) -> None:
         self.cfg = cfg
         self._last_pose = initial_pose.astype(np.float32).copy()
+        if self._last_pose.shape != (6,) or not np.all(np.isfinite(self._last_pose)):
+            raise ValueError("安全门初始法兰位姿必须是有效6维数组")
+        if np.any(self._last_pose[:3] < cfg.workspace_min) or np.any(
+            self._last_pose[:3] > cfg.workspace_max
+        ):
+            raise ValueError(
+                "安全门初始法兰位置不在工作空间内："
+                f"position={self._last_pose[:3].tolist()}, "
+                f"workspace=[{cfg.workspace_min.tolist()}, "
+                f"{cfg.workspace_max.tolist()}]"
+            )
         self._estop = False
 
     def emergency_stop(self) -> None:

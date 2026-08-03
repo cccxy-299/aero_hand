@@ -24,12 +24,43 @@ from model import (
 )
 from network import ZmqReceiver
 from retarget import HardwareBimanualRetargeter, PassthroughRetargeter, SideRetargetConfig
-from safety import SafetyConfig, SafetyGate
+from safety import SafetyConfig, SafetyGate, effective_control_step_m
 
 LOG = logging.getLogger(__name__)
 SIDES = ("left", "right")
 CAMERA_NAMES = ("scene", "wrist_left", "wrist_right")
 ALIGNMENT_NAMES = CAMERA_NAMES + ("robot_state", "control_action", "teleop")
+
+
+def _teleop_sample_readiness(
+    sample: TimedSample | None,
+    now_ns: int,
+    timeout_ns: int,
+) -> tuple[bool, str, float | None]:
+    """检查启动控制所需的最新双侧遥操作样本。"""
+    if sample is None:
+        return False, "no_teleop_packet", None
+    age_ns = int(now_ns) - int(sample.local_mono_ns)
+    age_ms = age_ns / 1e6
+    if age_ns > timeout_ns:
+        return False, f"teleop_stale(age_ms={age_ms:.1f})", age_ms
+    if age_ns < -timeout_ns:
+        return False, f"teleop_clock_in_future(age_ms={age_ms:.1f})", age_ms
+    if not sample.valid:
+        return False, "teleop_sample_invalid", age_ms
+    if not isinstance(sample.value, dict):
+        return False, "teleop_payload_not_object", age_ms
+    invalid_sides: list[str] = []
+    for side in SIDES:
+        side_value = sample.value.get(side)
+        if not isinstance(side_value, dict):
+            invalid_sides.append(f"{side}:missing")
+        elif not bool(side_value.get("valid", True)):
+            detail = str(side_value.get("invalid_reason", "valid=false"))
+            invalid_sides.append(f"{side}:{detail}")
+    if invalid_sides:
+        return False, ",".join(invalid_sides), age_ms
+    return True, "ready", age_ms
 
 
 def _configure_child_signals(stop_event: Any) -> None:
@@ -89,7 +120,11 @@ def _make_safety(
             SafetyConfig(
                 np.asarray(side_cfg["workspace_min"], np.float32),
                 np.asarray(side_cfg["workspace_max"], np.float32),
-                float(side_cfg["max_linear_step_m"]),
+                effective_control_step_m(
+                    float(side_cfg["max_linear_step_m"]),
+                    float(cfg["rates"]["control_hz"]),
+                    float(cfg["robot"].get("arm_command_hz", 30.0)),
+                ),
                 np.asarray(cfg["robot"]["hand_min"], np.float32),
                 np.asarray(cfg["robot"]["hand_max"], np.float32),
                 int(float(cfg["alignment"]["teleop_timeout_ms"]) * 1e6),
@@ -132,6 +167,18 @@ def _episode_initial_poses(
             if bool(cfg["robot"]["enabled"]):
                 raise RuntimeError(f"{side} Piper 当前末端位姿无效，拒绝 start")
             pose = np.asarray(cfg["robot"][side]["initial_pose"], np.float32)
+        workspace_min = np.asarray(
+            cfg["robot"][side]["workspace_min"], dtype=np.float32
+        )
+        workspace_max = np.asarray(
+            cfg["robot"][side]["workspace_max"], dtype=np.float32
+        )
+        if np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max):
+            raise RuntimeError(
+                f"{side} start法兰位置不在配置工作空间内："
+                f"position={pose[:3].tolist()}, "
+                f"workspace=[{workspace_min.tolist()}, {workspace_max.tolist()}]"
+            )
         result[side] = pose.copy()
     return result
 
@@ -211,6 +258,8 @@ def _control_process(
         "control_commands": 0,
         "unique_teleop_packets": 0,
         "reused_teleop_packets": 0,
+        "received_teleop_packets": 0,
+        "invalid_teleop_packets": 0,
     }
     robot = None
     retargeter = None
@@ -223,9 +272,19 @@ def _control_process(
     last_selected_teleop_seq: int | None = None
 
     def ingest(sample: TimedSample) -> None:
-        # 空闲时只完成网络时钟同步，不积压无效遥操作样本。
-        if sample.source == "teleop" and active:
-            teleop_buffer.append(sample)
+        if sample.source != "teleop":
+            return
+        # 缓冲区有界，空闲/准备阶段也保留最新样本，用于在回零和相机启动前
+        # 验证 MANUS/VIVE 双侧数据是否有效；只有 active 后才转发给 recorder。
+        teleop_buffer.append(sample)
+        metrics["received_teleop_packets"] += 1
+        if any(
+            not isinstance(sample.value.get(side), dict)
+            or not bool(sample.value[side].get("valid", True))
+            for side in SIDES
+        ):
+            metrics["invalid_teleop_packets"] += 1
+        if active:
             _put_latest(sample_queue, sample)
 
     def deactivate(reason: str) -> None:
@@ -318,6 +377,21 @@ def _control_process(
                 "control_rejected",
                 command="start",
                 reason="hardware_not_initialized",
+            )
+            return
+        input_ready, input_reason, input_age_ms = _teleop_sample_readiness(
+            teleop_buffer.latest(),
+            time.perf_counter_ns(),
+            teleop_timeout_ns,
+        )
+        if not input_ready:
+            _status_put(
+                status_queue,
+                "control",
+                "control_rejected",
+                command="start",
+                reason=f"teleop_not_ready:{input_reason}",
+                teleop_age_ms=input_age_ms,
             )
             return
         try:
@@ -465,6 +539,21 @@ def _control_process(
                     "control_rejected",
                     command="prepare_start",
                     reason="hardware_not_initialized",
+                )
+                return
+            input_ready, input_reason, input_age_ms = _teleop_sample_readiness(
+                teleop_buffer.latest(),
+                time.perf_counter_ns(),
+                teleop_timeout_ns,
+            )
+            if not input_ready:
+                _status_put(
+                    status_queue,
+                    "control",
+                    "control_rejected",
+                    command="prepare_start",
+                    reason=f"teleop_not_ready:{input_reason}",
+                    teleop_age_ms=input_age_ms,
                 )
                 return
             _status_put(
@@ -698,6 +787,13 @@ def _control_process(
             metrics["control_ticks"] += 1
             now_ns = time.perf_counter_ns()
             if now_ns - last_report_ns >= 1_000_000_000:
+                input_ready, input_reason, input_age_ms = (
+                    _teleop_sample_readiness(
+                        teleop_buffer.latest(),
+                        now_ns,
+                        teleop_timeout_ns,
+                    )
+                )
                 _status_put(
                     status_queue,
                     "control",
@@ -717,6 +813,15 @@ def _control_process(
                     teleop_mapping=getattr(
                         retargeter, "mapping_snapshot", lambda: {}
                     )(),
+                    teleop_input={
+                        "ready": input_ready,
+                        "reason": input_reason,
+                        "age_ms": (
+                            round(input_age_ms, 3)
+                            if input_age_ms is not None
+                            else None
+                        ),
+                    },
                     network={
                         "transport": "zmq",
                         "bad_packets": receiver.bad_packets,
@@ -1662,10 +1767,18 @@ def _recorder_process(
         episode_state = "stopping"
         stop_capture(require_stopped=not stop_event.is_set())
         quality_failures: list[str] = []
+        if episode_frames < min_frames:
+            missing = {
+                name: int(episode_diagnostics.get(f"missing_{name}", 0))
+                for name in ALIGNMENT_NAMES
+                if int(episode_diagnostics.get(f"missing_{name}", 0)) > 0
+            }
+            quality_failures.append(
+                f"complete_frames={episode_frames}<{min_frames}; "
+                f"missing={missing}"
+            )
         for name in CAMERA_NAMES:
             unique = int(episode_diagnostics.get(f"unique_used_{name}", 0))
-            ratio = unique / episode_frames if episode_frames > 0 else 0.0
-            episode_diagnostics[f"unique_ratio_{name}"] = round(ratio, 4)
             source_fps = float(
                 episode_diagnostics.get(f"source_fps_{name}", 0.0)
             )
@@ -1673,10 +1786,14 @@ def _recorder_process(
                 quality_failures.append(
                     f"{name}: source_fps={source_fps:.2f}<{min_camera_fps:.2f}"
                 )
-            if ratio < min_unique_ratio:
-                quality_failures.append(
-                    f"{name}: unique_ratio={ratio:.3f}<{min_unique_ratio:.3f}"
-                )
+            if episode_frames > 0:
+                ratio = unique / episode_frames
+                episode_diagnostics[f"unique_ratio_{name}"] = round(ratio, 4)
+                if ratio < min_unique_ratio:
+                    quality_failures.append(
+                        f"{name}: unique_ratio={ratio:.3f}<"
+                        f"{min_unique_ratio:.3f}"
+                    )
             error_ratio = float(
                 episode_diagnostics.get(f"camera_error_ratio_{name}", 0.0)
             )

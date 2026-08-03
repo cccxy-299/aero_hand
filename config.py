@@ -164,6 +164,8 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         workspace_max = [float(value) for value in side_cfg["workspace_max"]]
         if any(lower >= upper for lower, upper in zip(workspace_min, workspace_max)):
             raise ValueError(f"robot.{side} 工作空间上下界非法")
+        if float(side_cfg.get("max_linear_step_m", 0)) <= 0:
+            raise ValueError(f"robot.{side}.max_linear_step_m must be positive")
         if "home_pose" in side_cfg:
             home_pose = side_cfg["home_pose"]
             if not isinstance(home_pose, list) or len(home_pose) != 6:

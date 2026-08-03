@@ -197,13 +197,16 @@ quit
 机械臂子进程最终使用不执行 Python/SDK 析构器的退出方式，进一步避免未知
 `__del__` 清理逻辑触发隐式失能；控制器固件的通信丢失策略仍需在 Piper 侧确认。
 
-`control_hz` 是安全计算频率，不等于真实硬件命令频率。双臂 `move_p` 默认通过
-`robot.arm_command_hz: 30` 限频，等待期间只保留最新目标；机械臂反馈通过
+`control_hz` 是安全计算频率，不等于真实硬件命令频率。双臂 `move_p` 通过
+`robot.arm_command_hz` 限频（当前真机配置为5Hz），等待期间只保留最新目标；机械臂反馈通过
 `robot.arm_feedback_hz: 30` 限制真实 SDK 读取频率，并采用命令优先的缓存读取，
 避免100Hz状态组帧访问真实 SDK；双手默认通过 `robot.hand_command_hz: 60`
 限频。control 进程不会等待 `move_p` 或串口调用。运行日志中的
 `hardware.devices` 会分别输出4个进程的 `submitted`、`received`、`applied`、
 `applied_seq`、`feedback_age_ms` 和 `last_io_ms`，用于定位某一设备是否阻塞。
+`max_linear_step_m` 表示相邻两次真实 `move_p` 的期望最大位移；安全门会按
+`arm_command_hz / control_hz` 换算成每个控制 tick 的步长，避免“100Hz 安全计算、
+5Hz 硬件只取最新值”把多次步长累积成一次大幅跳变。
 
 三路相机按 `startup_delay_ms` 从小到大严格串行连接；只有上一相机完成
 `connect()` 并发布首帧后才激活下一路。`cameras.hardware_enabled` 与

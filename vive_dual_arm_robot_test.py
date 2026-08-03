@@ -23,7 +23,7 @@ from hardware_processes import (
     create_hardware_channels,
 )
 from retarget import HardwareBimanualRetargeter, SideRetargetConfig
-from safety import SafetyConfig, SafetyGate
+from safety import SafetyConfig, SafetyGate, effective_control_step_m
 
 
 LOG = logging.getLogger("vive-dual-arm-robot-test")
@@ -129,7 +129,11 @@ def _make_control(
             SafetyConfig(
                 workspace_min=workspace_min,
                 workspace_max=workspace_max,
-                max_linear_step_m=float(side_cfg["max_linear_step_m"]),
+                max_linear_step_m=effective_control_step_m(
+                    float(side_cfg["max_linear_step_m"]),
+                    float(cfg["rates"]["control_hz"]),
+                    float(cfg["robot"].get("arm_command_hz", 30.0)),
+                ),
                 hand_min=np.zeros(7, np.float32),
                 hand_max=np.zeros(7, np.float32),
                 stale_timeout_ns=int(

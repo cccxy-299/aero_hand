@@ -7,6 +7,8 @@ import symtable
 import types
 import unittest
 
+import numpy as np
+
 
 # 允许在只安装最小硬件测试依赖的环境中导入 process_pipeline；这些测试不创建
 # ZMQ socket。正式运行仍由 requirements.txt 强制提供 pyzmq。
@@ -26,10 +28,84 @@ from process_pipeline import (
     _camera_frame_advances,
     _camera_startup_order,
     _make_camera,
+    _teleop_sample_readiness,
 )
+from model import TimedSample
+from safety import SafetyConfig, SafetyGate, effective_control_step_m
 
 
 class IntegrationRegressionTests(unittest.TestCase):
+    def test_safety_step_is_scaled_to_real_arm_command_rate(self) -> None:
+        self.assertAlmostEqual(
+            effective_control_step_m(0.01, control_hz=100, arm_command_hz=5),
+            0.0005,
+        )
+
+    def test_safety_rejects_initial_pose_outside_workspace(self) -> None:
+        cfg = SafetyConfig(
+            np.array([0.05, -0.35, 0.05], np.float32),
+            np.array([0.40, 0.00, 0.45], np.float32),
+            0.0005,
+            np.zeros(7, np.float32),
+            np.full(7, 100, np.float32),
+            150_000_000,
+        )
+        with self.assertRaisesRegex(ValueError, "初始法兰位置不在工作空间"):
+            SafetyGate(
+                cfg,
+                np.array([0.25, 0.10, 0.25, 0, 0, 0], np.float32),
+            )
+
+    def test_start_rejects_fresh_but_invalid_bimanual_teleop(self) -> None:
+        now_ns = 2_000_000_000
+        sample = TimedSample(
+            "teleop",
+            1,
+            now_ns - 10_000_000,
+            now_ns - 10_000_000,
+            {
+                "left": {"valid": True},
+                "right": {"valid": False},
+            },
+        )
+        ready, reason, age_ms = _teleop_sample_readiness(
+            sample, now_ns, 150_000_000
+        )
+        self.assertFalse(ready)
+        self.assertIn("right:valid=false", reason)
+        self.assertAlmostEqual(age_ms, 10.0)
+
+    def test_start_accepts_fresh_valid_bimanual_teleop(self) -> None:
+        now_ns = 2_000_000_000
+        sample = TimedSample(
+            "teleop",
+            1,
+            now_ns - 10_000_000,
+            now_ns - 10_000_000,
+            {"left": {"valid": True}, "right": {"valid": True}},
+        )
+        ready, reason, _ = _teleop_sample_readiness(
+            sample, now_ns, 150_000_000
+        )
+        self.assertTrue(ready)
+        self.assertEqual(reason, "ready")
+
+    def test_start_rejects_stale_bimanual_teleop(self) -> None:
+        now_ns = 2_000_000_000
+        sample = TimedSample(
+            "teleop",
+            1,
+            now_ns - 200_000_000,
+            now_ns - 200_000_000,
+            {"left": {"valid": True}, "right": {"valid": True}},
+        )
+        ready, reason, age_ms = _teleop_sample_readiness(
+            sample, now_ns, 150_000_000
+        )
+        self.assertFalse(ready)
+        self.assertIn("teleop_stale", reason)
+        self.assertAlmostEqual(age_ms, 200.0)
+
     def test_arm_command_output_switch_is_local(self) -> None:
         source_path = Path(__file__).with_name("hardware_processes.py")
         table = symtable.symtable(

@@ -75,17 +75,58 @@ class HardwareOperatorSource:
         payload: dict[str, Any] = {}
         for side in ("left", "right"):
             vive_value = vive.get(side)
+            hand_age_ns = (
+                now - self._last_hand_ns
+                if self._last_hand_ns > 0
+                else None
+            )
+            vive_age_ns = (
+                now - vive_value[1]
+                if vive_value is not None
+                else None
+            )
             valid = (
                 vive_value is not None
                 and self._last_hand_ns > 0
-                and now - self._last_hand_ns <= self._max_age_ns
-                and now - vive_value[1] <= self._max_age_ns
+                and hand_age_ns is not None
+                and hand_age_ns <= self._max_age_ns
+                and vive_age_ns is not None
+                and vive_age_ns <= self._max_age_ns
             )
+            invalid_reasons: list[str] = []
+            if self._last_hand_ns <= 0:
+                invalid_reasons.append("manus_not_ready")
+            elif hand_age_ns is not None and hand_age_ns > self._max_age_ns:
+                invalid_reasons.append(
+                    f"manus_stale({hand_age_ns / 1e6:.1f}ms)"
+                )
+            if vive_value is None:
+                invalid_reasons.append("vive_missing")
+            elif vive_age_ns is not None and vive_age_ns > self._max_age_ns:
+                invalid_reasons.append(
+                    f"vive_stale({vive_age_ns / 1e6:.1f}ms)"
+                )
             payload[side] = {
                 # 设备 B 可直接将该7维命令交给 Aerohand 安全门和驱动层。
                 "hand_joints": self._last_hand[side].tolist(),
                 "vive_pose": vive_value[0] if vive_value else [0.0] * 7,
                 "valid": valid,
+                # 额外字段不会进入控制指令，仅用于设备 B 启动门控和日志诊断。
+                "invalid_reason": (
+                    "ready" if valid else "+".join(invalid_reasons)
+                ),
+                "source_age_ms": {
+                    "manus": (
+                        round(max(0, hand_age_ns) / 1e6, 3)
+                        if hand_age_ns is not None
+                        else None
+                    ),
+                    "vive": (
+                        round(max(0, vive_age_ns) / 1e6, 3)
+                        if vive_age_ns is not None
+                        else None
+                    ),
+                },
             }
         return payload
 

@@ -363,6 +363,8 @@ def arm_hardware_process(
     last_command_ns = 0
     last_feedback_ns = 0
     last_status_ns = 0
+    last_target_pose: np.ndarray | None = None
+    last_target_source_seq: int | None = None
     exit_code = 0
     command_interval_ns = int(1e9 / float(robot_cfg.get("arm_command_hz", 30.0)))
     feedback_interval_ns = int(1e9 / float(robot_cfg.get("arm_feedback_hz", 30.0)))
@@ -472,6 +474,11 @@ def arm_hardware_process(
                         arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
                         channel["hold_event"].clear()
                         active = True
+                        # 不在刚切换 ACTIVE 时读取上一会话残留的 MOVE_P 状态；
+                        # 第一条新目标发出后等待一个完整轮询周期再检查控制器。
+                        last_status_ns = time.perf_counter_ns()
+                        last_target_pose = None
+                        last_target_source_seq = None
                         _set_phase(channel, PHASE_ACTIVE)
                         _put_response(channel, request, ok=True, state="active")
                     elif kind in {"stop", "cancel_prepare"}:
@@ -536,6 +543,8 @@ def arm_hardware_process(
                     active = False
                     continue
                 pose = _array(target["target"], (6,), f"{side} move_p target")
+                last_target_pose = pose.copy()
+                last_target_source_seq = int(target.get("source_seq", -1))
                 # started_ns = time.perf_counter_ns()
                 # arm.move_p(pose.tolist())
                 # _update_arm_feedback(
@@ -581,10 +590,22 @@ def arm_hardware_process(
                 message = getattr(status, "msg", status)
                 arm_status = getattr(message, "arm_status", None)
                 if isinstance(arm_status, int) and arm_status != 0:
+                    with channel["state_lock"]:
+                        feedback_pose = [
+                            float(value) for value in channel["pose"][:]
+                        ]
+                    target_values = (
+                        last_target_pose.tolist()
+                        if last_target_pose is not None
+                        else None
+                    )
                     raise RuntimeError(
                         f"{side} Piper 控制器状态异常: arm_status={arm_status}, "
                         f"mode_feedback={getattr(message, 'mode_feedback', None)}, "
-                        f"err_status={getattr(message, 'err_status', None)}"
+                        f"err_status={getattr(message, 'err_status', None)}, "
+                        f"last_target={target_values}, "
+                        f"last_target_source_seq={last_target_source_seq}, "
+                        f"feedback_pose={feedback_pose}"
                     )
                 last_status_ns = now_ns
             stop_event.wait(0.001)
