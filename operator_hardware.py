@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -11,60 +10,7 @@ from manus_aero_retargeting_two_hands import (
     ManusToAeroRetargeter,
 )
 from thumb_cmc_calibrator import ThumbCMCCalibrator
-import pysurvive
-
-
-class DualViveReader:
-    """设备 A 的双 VIVE Tracker 后台采集器。"""
-    def __init__(self, tracker_names: dict[str, str], survive_args: list[str] | None = None) -> None:
-        self._context = pysurvive.SimpleContext(survive_args or ["teleop_collect"])
-        self._tracker_to_side = {name: side for side, name in tracker_names.items()}
-        self._latest: dict[str, tuple[list[float], int]] = {}
-        self._latest_lighthouses: dict[str, tuple[list[float], int]] = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="dual-vive", daemon=True)
-        self._thread.start()
-
-    @staticmethod
-    def _name(obj: Any) -> str:
-        value = obj.Name()
-        return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
-
-    def _run(self) -> None:
-        while self._context.Running() and not self._stop.is_set():
-            obj = self._context.NextUpdated()
-            if obj is None:
-                continue
-            name = self._name(obj)
-            side = self._tracker_to_side.get(name)
-            is_lighthouse = name.startswith("LH")
-            if side is None and not is_lighthouse:
-                continue
-            pose, _ = obj.Pose()
-            value = [
-                float(pose.Pos[0]), float(pose.Pos[1]), float(pose.Pos[2]),
-                float(pose.Rot[0]), float(pose.Rot[1]),
-                float(pose.Rot[2]), float(pose.Rot[3]),
-            ]
-            with self._lock:
-                timestamp_ns = time.perf_counter_ns()
-                if side is not None:
-                    self._latest[side] = (value, timestamp_ns)
-                else:
-                    self._latest_lighthouses[name] = (value, timestamp_ns)
-
-    def snapshot(self) -> dict[str, tuple[list[float], int]]:
-        with self._lock:
-            return dict(self._latest)
-
-    def lighthouse_snapshot(self) -> dict[str, tuple[list[float], int]]:
-        """返回 Lighthouse 位姿快照，供 GUI 使用，不影响遥操作发送链路。"""
-        with self._lock:
-            return dict(self._latest_lighthouses)
-
-    def close(self) -> None:
-        self._stop.set()
+from vive_reader import DualViveReader
 
 
 class HardwareOperatorSource:

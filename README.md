@@ -33,6 +33,43 @@ cd teleop_collect
 python operator_main.py --config cfg/operator.yaml
 ```
 
+## 仅 VIVE 遥操作双臂的 ZMQ 测试
+
+该测试链路不创建 MANUS、Aerohand、相机、Recorder 或 LeRobot Writer，只验证
+双 VIVE Tracker → ZMQ → 坐标映射/安全门 → 双 Piper。不要与 `robot_main.py`
+同时运行，否则两个进程会争用相同 CAN 接口。
+
+先在设备B启动接收端：
+
+```bash
+cd teleop_collect
+python vive_dual_arm_robot_test.py \
+  --config cfg/robot.yaml \
+  --bind 'tcp://*:17861' \
+  --scale 0.10
+```
+
+再在设备A启动发送端，其中地址填写设备B IP：
+
+```bash
+cd teleop_collect
+python vive_dual_arm_operator_test.py \
+  --config cfg/operator.yaml \
+  --endpoint 'tcp://172.16.83.95:17861'
+```
+
+设备B终端支持 `start | stop | status | quit`。`start` 会先按右臂、左臂顺序执行
+`move_j(home_pose)`，随后第一条双侧有效 Tracker 消息只用于建立相对位置参考。
+默认 `--scale 0.10` 用于低速单轴确认，方向无误后再逐步增加。运行日志中的
+`mapping` 显示 `vive_delta_xyz` 和 `robot_delta_xyz`；`hardware.devices.arm_left/right`
+显示 `submitted/applied/applied_seq/feedback_age_ms/last_io_ms`。
+
+ZMQ 使用设备A `PUSH`、设备B `PULL`，`SNDHWM/RCVHWM=1` 且设备B启用
+`CONFLATE`，拥塞时只保留最新消息。任一 Tracker 无效或过期时双臂联锁保持上一目标。
+`stop`、异常和 `quit` 均不自动调用 Piper `disable()`。
+这是控制方向/频率隔离测试，不写训练数据，也不做正式采集链路中的跨机单调时钟
+映射；设备B使用设备A上报的 Tracker 年龄和本机收包后年龄执行超时保护。
+
 设备 A 可选择开启或关闭 VIVE 三维可视化：
 
 ```powershell

@@ -43,8 +43,13 @@ PHASE_NAMES = {
 }
 
 
-def create_hardware_channels(ctx: Any, cfg: dict[str, Any]) -> dict[str, Any]:
-    """在设备B父进程中创建四个硬件进程所需的有界 IPC。"""
+def create_hardware_channels(
+    ctx: Any,
+    cfg: dict[str, Any],
+    *,
+    include_hands: bool = True,
+) -> dict[str, Any]:
+    """创建硬件进程所需的有界 IPC；测试时可只创建双臂通道。"""
     capacity = int(cfg.get("hardware_command_queue_capacity", 16))
     channels: dict[str, Any] = {}
     for side in SIDES:
@@ -69,6 +74,8 @@ def create_hardware_channels(ctx: Any, cfg: dict[str, Any]) -> dict[str, Any]:
             "last_io_ms": ctx.Value("d", 0.0),
             "max_io_ms": ctx.Value("d", 0.0),
         }
+        if not include_hands:
+            continue
         channels[f"hand_{side}"] = {
             "kind": "hand",
             "side": side,
@@ -801,3 +808,102 @@ class MultiprocessRobotProxy:
             "arm_auto_disable": False,
             "devices": devices,
         }
+
+
+class DualArmProcessProxy(MultiprocessRobotProxy):
+    """仅包含左右 Piper 的测试代理，不创建或访问 Aerohand。"""
+
+    def home(self) -> None:
+        if self.state != "idle_enabled":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 home")
+        timeout_s = float(self.cfg.get("hardware_request_timeout_s", 30.0))
+        for device in ("arm_right", "arm_left"):
+            self._request(device, "home", timeout_s)
+        self.homed = True
+
+    def prepare_start(self) -> None:
+        if self.state != "idle_enabled":
+            raise RuntimeError(f"当前状态 {self.state} 不允许 prepare_start")
+        timeout_s = float(self.cfg.get("hardware_request_timeout_s", 30.0))
+        self.state = "preparing_start"
+        try:
+            for device in ("arm_right", "arm_left"):
+                self._request(device, "prepare_start", timeout_s)
+            self.homed = True
+            self.start_prepared = True
+            self.start_home_count += 1
+            self.state = "prepared_enabled"
+        except BaseException:
+            self._best_effort_hold("cancel_prepare")
+            self.start_prepared = False
+            self.state = "fault_hold_enabled"
+            raise
+
+    def activate(self) -> None:
+        if self.state != "prepared_enabled" or not self.start_prepared:
+            raise RuntimeError(f"当前状态 {self.state} 不允许 activate")
+        timeout_s = float(self.cfg.get("hardware_request_timeout_s", 30.0))
+        try:
+            for device in ("arm_left", "arm_right"):
+                self._request(device, "activate", timeout_s)
+            self.state = "active"
+            self.start_prepared = False
+        except BaseException:
+            self._best_effort_hold("stop")
+            self.state = "fault_hold_enabled"
+            raise
+
+    def command_poses(
+        self,
+        left: np.ndarray,
+        right: np.ndarray,
+        source_seq: int,
+    ) -> None:
+        if not self.active:
+            raise RuntimeError(f"当前状态 {self.state} 不允许下发双臂目标")
+        for side, target in (("left", left), ("right", right)):
+            pose = np.asarray(target, dtype=np.float32)
+            if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+                raise ValueError(f"{side} 双臂测试目标必须是有效6维末端位姿")
+            device = f"arm_{side}"
+            channel = self.channels[device]
+            if bool(channel["fault"].value):
+                self.state = "fault_hold_enabled"
+                raise RuntimeError(f"{device} 硬件进程发生异常")
+            channel["submitted"].value += 1
+            _put_latest_target(
+                channel["target_queue"],
+                {
+                    "session_id": self.start_home_count,
+                    "source_seq": int(source_seq),
+                    "target": pose,
+                    "target_mono_ns": time.perf_counter_ns(),
+                },
+            )
+
+    def read_state(self) -> BimanualRobotState:
+        states: dict[str, RobotState] = {}
+        for side in SIDES:
+            pose, joints, _ = self._read_arm(side)
+            states[side] = RobotState(
+                pose,
+                joints,
+                np.zeros(7, dtype=np.float32),
+            )
+        return BimanualRobotState(states["left"], states["right"])
+
+    def feedback_timestamps_ns(self) -> dict[str, int]:
+        return {side: self._read_arm(side)[2] for side in SIDES}
+
+    def _best_effort_hold(self, kind: str = "stop") -> None:
+        timeout_s = min(
+            float(self.cfg.get("hardware_hold_ack_timeout_s", 0.5)),
+            float(self.cfg.get("hardware_request_timeout_s", 30.0)),
+        )
+        for device in ("arm_left", "arm_right"):
+            try:
+                self._request(device, kind, timeout_s)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "%s 未确认 hold；不会调用机械臂 disable", device
+                )
