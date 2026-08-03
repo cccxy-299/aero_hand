@@ -140,6 +140,7 @@ class ZmqReceiver:
         self.bad_packets = 0
         self.sequence_gaps = 0
         self.sync_updates = 0
+        self.sync_rejected = 0
         self._last_seq: int | None = None
 
     def wait_ready(self, timeout_s: float = 5.0) -> None:
@@ -195,13 +196,16 @@ class ZmqReceiver:
                 raise ValueError("unexpected sync packet kind")
             previous = packet.payload.get("previous")
             if previous is not None:
-                self.mapper.observe_round_trip(
+                accepted = self.mapper.observe_round_trip(
                     int(previous["a_send"]),
                     int(previous["b_recv"]),
                     int(previous["b_send"]),
                     int(previous["a_recv"]),
                 )
-                self.sync_updates += 1
+                if accepted:
+                    self.sync_updates += 1
+                else:
+                    self.sync_rejected += 1
             b_send = time.perf_counter_ns()
             reply = Packet(
                 "sync_reply",

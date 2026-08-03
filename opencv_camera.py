@@ -132,11 +132,11 @@ class OpenCVCamera:
                         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
                     ),
                     "fps": bool(capture.set(cv2.CAP_PROP_FPS, cfg.fps)),
-                    "buffer_size": bool(
-                        capture.set(
-                            cv2.CAP_PROP_BUFFERSIZE, cfg.buffer_size
-                        )
-                    ),
+                    # "buffer_size": bool(
+                    #     capture.set(
+                    #         cv2.CAP_PROP_BUFFERSIZE, cfg.buffer_size
+                    #     )
+                    # ),
                 }
             )
 
@@ -154,9 +154,9 @@ class OpenCVCamera:
                 "fourcc": _decode_fourcc(
                     capture.get(cv2.CAP_PROP_FOURCC)
                 ),
-                "buffer_size": float(
-                    capture.get(cv2.CAP_PROP_BUFFERSIZE)
-                ),
+                # "buffer_size": float(
+                #     capture.get(cv2.CAP_PROP_BUFFERSIZE)
+                # ),
                 "property_set_results": dict(self._property_results),
             }
             if (

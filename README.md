@@ -74,6 +74,9 @@ python vive_dual_arm_operator_test.py \
 
 ZMQ 使用设备A `PUSH`、设备B `PULL`，`SNDHWM/RCVHWM=1` 且设备B启用
 `CONFLATE`，拥塞时只保留最新消息。任一 Tracker 无效或过期时双臂联锁保持上一目标。
+跨机 NTP 样本只有实际被 `ClockMapper` 接受后才计入 `sync_updates`；控制安全超时
+使用设备B本机收包时间，跨机映射时间仅用于 recorder 对齐，避免机器启动时长不同
+导致遥操作包被误判为来自未来。
 `stop`、异常和 `quit` 均不自动调用 Piper `disable()`。
 `stop` 会先通过共享 `hold_event` 同时门控左右臂，再异步通知硬件进程清空目标；
 因此即使某侧 SDK 暂时阻塞，也不会因为等待 stop ACK 反向阻塞控制端。

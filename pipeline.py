@@ -25,6 +25,16 @@ from safety import SafetyGate
 LOG = logging.getLogger(__name__)
 
 
+def _teleop_receive_age_ns(sample: TimedSample, now_ns: int) -> int:
+    receive_ns = sample.meta.get("receive_mono_ns")
+    reference_ns = (
+        int(receive_ns)
+        if isinstance(receive_ns, int) and receive_ns > 0
+        else int(sample.local_mono_ns)
+    )
+    return int(now_ns) - reference_ns
+
+
 @dataclass
 class Metrics:
     control_ticks: int = 0
@@ -146,7 +156,7 @@ class RobotPipeline:
         for side in ("left", "right"):
             side_command: TeleopCommand = getattr(command, side)
             safe_by_side[side] = self.safety[side].apply(
-                side_command, now_ns - selected.local_mono_ns
+                side_command, _teleop_receive_age_ns(selected, now_ns)
             )
         # 左右命令源于同一个网络序列号，作为一份原子命令提交给硬件层。
         safe = BimanualControlCommand(

@@ -18,15 +18,19 @@ class ClockMapper:
         self._offset_ns = 0
         self._lock = threading.Lock()
 
-    def observe_round_trip(self, a_send: int, b_recv: int, b_send: int, a_recv: int) -> None:
+    def observe_round_trip(
+        self, a_send: int, b_recv: int, b_send: int, a_recv: int
+    ) -> bool:
+        """接收一组 NTP 四时间戳；只有偏移样本实际生效时返回 True。"""
         rtt = (a_recv - a_send) - (b_send - b_recv)
         offset_b_minus_a = ((b_recv - a_send) + (b_send - a_recv)) // 2
         if rtt < 0:
-            return
+            return False
         with self._lock:
             self._samples.append((rtt, offset_b_minus_a))
             best = sorted(self._samples)[: max(1, len(self._samples) // 2)]
             self._offset_ns = int(statistics.median(x[1] for x in best))
+        return True
 
     def set_offset_for_test(self, offset_ns: int) -> None:
         with self._lock:
@@ -41,3 +45,7 @@ class ClockMapper:
         with self._lock:
             return self._offset_ns
 
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._samples)

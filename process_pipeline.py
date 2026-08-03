@@ -32,6 +32,17 @@ CAMERA_NAMES = ("scene", "wrist_left", "wrist_right")
 ALIGNMENT_NAMES = CAMERA_NAMES + ("robot_state", "control_action", "teleop")
 
 
+def _teleop_age_ns(sample: TimedSample, now_ns: int) -> int:
+    """控制安全使用设备 B 本机收包时间，不依赖可能刚更新的跨机偏移。"""
+    receive_ns = sample.meta.get("receive_mono_ns")
+    reference_ns = (
+        int(receive_ns)
+        if isinstance(receive_ns, int) and receive_ns > 0
+        else int(sample.local_mono_ns)
+    )
+    return int(now_ns) - reference_ns
+
+
 def _teleop_sample_readiness(
     sample: TimedSample | None,
     now_ns: int,
@@ -40,7 +51,7 @@ def _teleop_sample_readiness(
     """检查启动控制所需的最新双侧遥操作样本。"""
     if sample is None:
         return False, "no_teleop_packet", None
-    age_ns = int(now_ns) - int(sample.local_mono_ns)
+    age_ns = _teleop_age_ns(sample, now_ns)
     age_ms = age_ns / 1e6
     if age_ns > timeout_ns:
         return False, f"teleop_stale(age_ms={age_ms:.1f})", age_ms
@@ -639,6 +650,8 @@ def _control_process(
                         "bad_packets": receiver.bad_packets,
                         "sequence_gaps": receiver.sequence_gaps,
                         "sync_updates": receiver.sync_updates,
+                        "sync_rejected": receiver.sync_rejected,
+                        "clock_sample_count": receiver.mapper.sample_count,
                         "clock_offset_ns": receiver.mapper.offset_ns,
                     }
                     if receiver is not None
@@ -730,7 +743,7 @@ def _control_process(
                     else:
                         metrics["unique_teleop_packets"] += 1
                         last_selected_teleop_seq = selected.seq
-                    teleop_age_ns = tick_start_ns - selected.local_mono_ns
+                    teleop_age_ns = _teleop_age_ns(selected, tick_start_ns)
                     if teleop_age_ns > teleop_timeout_ns:
                         # 过期包不能用于建立 VIVE 零点，也不应继续刷新手部命令。
                         # 硬件命令线程会自然保持最后一条已接受的安全目标。
@@ -827,6 +840,8 @@ def _control_process(
                         "bad_packets": receiver.bad_packets,
                         "sequence_gaps": receiver.sequence_gaps,
                         "sync_updates": receiver.sync_updates,
+                        "sync_rejected": receiver.sync_rejected,
+                        "clock_sample_count": receiver.mapper.sample_count,
                         "clock_offset_ns": receiver.mapper.offset_ns,
                     },
                 )
