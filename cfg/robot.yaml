@@ -52,7 +52,6 @@ robot:
   hardware_command_queue_capacity: 16
   hardware_start_timeout_s: 20
   hardware_request_timeout_s: 30
-  hardware_hold_ack_timeout_s: 0.5
   # 必须先在终端显式执行 home 并成功，之后才允许 start episode。
   require_home_before_start: true
   worker_stop_timeout_s: 3

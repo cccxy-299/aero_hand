@@ -61,6 +61,8 @@ def create_hardware_channels(
             "target_queue": ctx.Queue(maxsize=1),
             "response_queue": ctx.Queue(maxsize=capacity),
             "ready_event": ctx.Event(),
+            # control可跨进程立即置位；即使SDK线程暂时阻塞，也不会再接受后续目标。
+            "hold_event": ctx.Event(),
             "fault": ctx.Value("b", False),
             "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
@@ -85,6 +87,7 @@ def create_hardware_channels(
             "target_queue": ctx.Queue(maxsize=1),
             "response_queue": ctx.Queue(maxsize=capacity),
             "ready_event": ctx.Event(),
+            "hold_event": ctx.Event(),
             "fault": ctx.Value("b", False),
             "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
@@ -361,6 +364,7 @@ def arm_hardware_process(
         )
         _wait_initial_arm_feedback(channel, arm, side_cfg, side)
         last_feedback_ns = time.perf_counter_ns()
+        channel["hold_event"].set()
         _set_phase(channel, PHASE_HOLD)
         channel["ready_event"].set()
         _status_put(
@@ -372,6 +376,11 @@ def arm_hardware_process(
         )
 
         while not stop_event.is_set():
+            if channel["hold_event"].is_set() and active:
+                # 共享门控优先于生命周期Queue ACK：立即停止消费后续目标。
+                active = False
+                _drain_latest(channel["target_queue"])
+                _set_phase(channel, PHASE_HOLD)
             request: dict[str, Any] | None = None
             try:
                 request = channel["control_queue"].get_nowait()
@@ -382,6 +391,7 @@ def arm_hardware_process(
                 kind = str(request.get("kind", ""))
                 try:
                     if kind in {"home", "prepare_start"}:
+                        channel["hold_event"].set()
                         active = False
                         target = _array(
                             side_cfg["home_pose"], (6,), f"{side} home_pose"
@@ -409,11 +419,13 @@ def arm_hardware_process(
                                 f"{side} Piper 尚未完成 prepare_start"
                             )
                         arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
+                        channel["hold_event"].clear()
                         active = True
                         _set_phase(channel, PHASE_ACTIVE)
                         _put_response(channel, request, ok=True, state="active")
                     elif kind in {"stop", "cancel_prepare"}:
                         # 停止消费新目标，但保持当前控制器使能状态和最后目标。
+                        channel["hold_event"].set()
                         active = False
                         _drain_latest(channel["target_queue"])
                         _set_phase(channel, PHASE_HOLD)
@@ -457,6 +469,10 @@ def arm_hardware_process(
                     newer = _drain_latest(channel["target_queue"])
                     if newer is not None:
                         target = newer
+                if channel["hold_event"].is_set():
+                    # 限频等待期间收到stop，不再执行已经取出的旧目标。
+                    active = False
+                    continue
                 pose = _array(target["target"], (6,), f"{side} move_p target")
                 started_ns = time.perf_counter_ns()
                 arm.move_p(pose.tolist())
@@ -514,6 +530,7 @@ def arm_hardware_process(
         # 用户明确要求：异常、终止和普通退出都不允许自动 disable。
         # 也不主动调用 disconnect，避免厂商 SDK 在 disconnect 内部隐式失能。
         active = False
+        channel["hold_event"].set()
         _set_phase(channel, PHASE_EXIT_HOLD)
         _status_put(
             status_queue,
@@ -554,11 +571,16 @@ def hand_hardware_process(
         hand = AeroHand(port=side_cfg["hand_port"])
         _wait_initial_hand_feedback(channel, hand, side_cfg, side)
         last_feedback_ns = time.perf_counter_ns()
+        channel["hold_event"].set()
         _set_phase(channel, PHASE_HOLD)
         channel["ready_event"].set()
         _status_put(status_queue, process_name, "ready", state="hold")
 
         while not stop_event.is_set():
+            if channel["hold_event"].is_set() and active:
+                active = False
+                _drain_latest(channel["target_queue"])
+                _set_phase(channel, PHASE_HOLD)
             request: dict[str, Any] | None = None
             try:
                 request = channel["control_queue"].get_nowait()
@@ -568,6 +590,7 @@ def hand_hardware_process(
                 kind = str(request.get("kind", ""))
                 try:
                     if kind == "home":
+                        channel["hold_event"].set()
                         active = False
                         result = hand.send_homing()
                         if result is False:
@@ -579,6 +602,7 @@ def hand_hardware_process(
                         _set_phase(channel, PHASE_HOLD)
                         _put_response(channel, request, ok=True, state="hold")
                     elif kind == "prepare_start":
+                        channel["hold_event"].set()
                         _set_phase(channel, PHASE_PREPARED)
                         _put_response(channel, request, ok=True, state="prepared")
                     elif kind == "activate":
@@ -587,9 +611,11 @@ def hand_hardware_process(
                                 f"{side} Aerohand 尚未完成 prepare_start"
                             )
                         active = True
+                        channel["hold_event"].clear()
                         _set_phase(channel, PHASE_ACTIVE)
                         _put_response(channel, request, ok=True, state="active")
                     elif kind in {"stop", "cancel_prepare"}:
+                        channel["hold_event"].set()
                         active = False
                         _drain_latest(channel["target_queue"])
                         _set_phase(channel, PHASE_HOLD)
@@ -620,6 +646,9 @@ def hand_hardware_process(
                     newer = _drain_latest(channel["target_queue"])
                     if newer is not None:
                         target = newer
+                if channel["hold_event"].is_set():
+                    active = False
+                    continue
                 joints = _array(target["target"], (7,), f"{side} hand target")
                 started_ns = time.perf_counter_ns()
                 hand.set_joint_positions(joints.tolist())
@@ -654,6 +683,7 @@ def hand_hardware_process(
         stop_event.set()
     finally:
         active = False
+        channel["hold_event"].set()
         if hand is not None:
             try:
                 if hasattr(hand, "close"):
@@ -715,6 +745,20 @@ class MultiprocessRobotProxy:
                 )
             return response
         raise TimeoutError(f"等待 {device} {kind} ACK 超时 {timeout_s:.1f}s")
+
+    def _request_no_wait(self, device: str, kind: str) -> None:
+        """投递无需ACK阻塞的hold命令；共享hold_event才是停止入口。"""
+        channel = self.channels[device]
+        self._request_id += 1
+        request = {"kind": kind, "request_id": self._request_id}
+        try:
+            channel["control_queue"].put_nowait(request)
+        except queue.Full:
+            logging.getLogger(__name__).warning(
+                "%s 生命周期队列已满，未排入%s；共享hold门控仍已生效",
+                device,
+                kind,
+            )
 
     def initialize(self) -> None:
         if self.state != "new":
@@ -838,17 +882,12 @@ class MultiprocessRobotProxy:
         return result
 
     def _best_effort_hold(self, kind: str = "stop") -> None:
-        timeout_s = min(
-            float(self.cfg.get("hardware_hold_ack_timeout_s", 0.5)),
-            float(self.cfg.get("hardware_request_timeout_s", 30.0)),
-        )
-        for device in ("arm_left", "arm_right", "hand_left", "hand_right"):
-            try:
-                self._request(device, kind, timeout_s)
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "%s 未确认 hold；不会调用机械臂 disable", device
-                )
+        devices = ("arm_left", "arm_right", "hand_left", "hand_right")
+        # 先原子式门控全部设备，再异步通知设备更新phase并清空本地目标。
+        for device in devices:
+            self.channels[device]["hold_event"].set()
+        for device in devices:
+            self._request_no_wait(device, kind)
 
     def deactivate(self) -> None:
         if self.state in {"new", "closed", "idle_enabled"}:
@@ -875,6 +914,7 @@ class MultiprocessRobotProxy:
             stamp_ns = int(channel["stamp_ns"].value)
             devices[name] = {
                 "phase": PHASE_NAMES.get(int(channel["phase"].value), "unknown"),
+                "hold_requested": channel["hold_event"].is_set(),
                 "ready": channel["ready_event"].is_set(),
                 "fault": bool(channel["fault"].value),
                 "error": _get_channel_error(channel),
@@ -993,14 +1033,8 @@ class DualArmProcessProxy(MultiprocessRobotProxy):
         return {side: self._read_arm(side)[2] for side in SIDES}
 
     def _best_effort_hold(self, kind: str = "stop") -> None:
-        timeout_s = min(
-            float(self.cfg.get("hardware_hold_ack_timeout_s", 0.5)),
-            float(self.cfg.get("hardware_request_timeout_s", 30.0)),
-        )
-        for device in ("arm_left", "arm_right"):
-            try:
-                self._request(device, kind, timeout_s)
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "%s 未确认 hold；不会调用机械臂 disable", device
-                )
+        devices = ("arm_left", "arm_right")
+        for device in devices:
+            self.channels[device]["hold_event"].set()
+        for device in devices:
+            self._request_no_wait(device, kind)

@@ -238,7 +238,6 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for name, default in (
         ("hardware_start_timeout_s", 20),
         ("hardware_request_timeout_s", 30),
-        ("hardware_hold_ack_timeout_s", 0.5),
     ):
         if float(cfg["robot"].get(name, default)) <= 0:
             raise ValueError(f"robot.{name} must be positive")

@@ -67,6 +67,8 @@ python vive_dual_arm_operator_test.py \
 ZMQ 使用设备A `PUSH`、设备B `PULL`，`SNDHWM/RCVHWM=1` 且设备B启用
 `CONFLATE`，拥塞时只保留最新消息。任一 Tracker 无效或过期时双臂联锁保持上一目标。
 `stop`、异常和 `quit` 均不自动调用 Piper `disable()`。
+`stop` 会先通过共享 `hold_event` 同时门控左右臂，再异步通知硬件进程清空目标；
+因此即使某侧 SDK 暂时阻塞，也不会因为等待 stop ACK 反向阻塞控制端。
 这是控制方向/频率隔离测试，不写训练数据，也不做正式采集链路中的跨机单调时钟
 映射；设备B使用设备A上报的 Tracker 年龄和本机收包后年龄执行超时保护。
 
