@@ -41,6 +41,7 @@ PHASE_NAMES = {
     PHASE_FAULT_HOLD: "fault_hold_enabled",
     PHASE_EXIT_HOLD: "exit_hold_enabled",
 }
+ERROR_TEXT_BYTES = 4096
 
 
 def create_hardware_channels(
@@ -61,6 +62,7 @@ def create_hardware_channels(
             "response_queue": ctx.Queue(maxsize=capacity),
             "ready_event": ctx.Event(),
             "fault": ctx.Value("b", False),
+            "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
             "state_lock": ctx.Lock(),
             "pose": ctx.Array("d", 6, lock=False),
@@ -84,6 +86,7 @@ def create_hardware_channels(
             "response_queue": ctx.Queue(maxsize=capacity),
             "ready_event": ctx.Event(),
             "fault": ctx.Value("b", False),
+            "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
             "state_lock": ctx.Lock(),
             "joints": ctx.Array("d", 7, lock=False),
@@ -179,6 +182,24 @@ def _set_phase(channel: dict[str, Any], phase: int) -> None:
     channel["phase"].value = int(phase)
 
 
+def _set_channel_error(channel: dict[str, Any], error: BaseException | str) -> None:
+    """错误写入共享内存，避免子进程快速退出时Queue诊断尚未刷新。"""
+    text = error if isinstance(error, str) else repr(error)
+    encoded = text.encode("utf-8", errors="replace")[: ERROR_TEXT_BYTES - 1]
+    shared = channel["error_text"]
+    with shared.get_lock():
+        shared[:] = [0] * ERROR_TEXT_BYTES
+        shared[: len(encoded)] = list(encoded)
+
+
+def _get_channel_error(channel: dict[str, Any]) -> str | None:
+    shared = channel["error_text"]
+    with shared.get_lock():
+        raw = bytes(shared[:])
+    value = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+    return value or None
+
+
 def _update_arm_feedback(
     channel: dict[str, Any], arm: Any, applied_seq: int | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -205,6 +226,51 @@ def _update_hand_feedback(
         if applied_seq is not None:
             channel["applied_seq"].value = int(applied_seq)
     return joints
+
+
+def _wait_initial_arm_feedback(
+    channel: dict[str, Any],
+    arm: Any,
+    side_cfg: dict[str, Any],
+    side: str,
+) -> None:
+    """connect后SDK/CAN反馈可能尚未就绪，必须在健康超时内重试。"""
+    timeout_s = float(side_cfg.get("health_timeout_s", 3.0))
+    deadline = time.monotonic() + timeout_s
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        try:
+            _update_arm_feedback(channel, arm)
+            return
+        except BaseException as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"{side} Piper connect后{timeout_s:.1f}s内没有有效反馈；"
+        f"last_error={last_error!r}"
+    )
+
+
+def _wait_initial_hand_feedback(
+    channel: dict[str, Any],
+    hand: Any,
+    side_cfg: dict[str, Any],
+    side: str,
+) -> None:
+    timeout_s = float(side_cfg.get("health_timeout_s", 3.0))
+    deadline = time.monotonic() + timeout_s
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        try:
+            _update_hand_feedback(channel, hand)
+            return
+        except BaseException as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"{side} Aerohand连接后{timeout_s:.1f}s内没有有效反馈；"
+        f"last_error={last_error!r}"
+    )
 
 
 def _enable_arm(arm: Any, side_cfg: dict[str, Any], side: str) -> None:
@@ -267,6 +333,7 @@ def arm_hardware_process(
     command_interval_ns = int(1e9 / float(robot_cfg.get("arm_command_hz", 30.0)))
     feedback_interval_ns = int(1e9 / float(robot_cfg.get("arm_feedback_hz", 30.0)))
     try:
+        logging.info("%s 正在加载 pyAgxArm", side)
         from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
 
         arm_config = create_agx_arm_config(
@@ -277,10 +344,22 @@ def arm_hardware_process(
             bitrate=int(side_cfg.get("bitrate", 1_000_000)),
         )
         arm = AgxArmFactory.create_arm(arm_config)
+        logging.info(
+            "%s Piper 正在连接 interface=%s channel=%s bitrate=%s",
+            side,
+            side_cfg["interface"],
+            side_cfg.get("channel", "0"),
+            side_cfg.get("bitrate", 1_000_000),
+        )
         arm.connect()
         # 不在启动阶段自动 disable：如果控制器此前正在承重，disable 可能造成跌落。
         arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
-        _update_arm_feedback(channel, arm)
+        logging.info(
+            "%s Piper connect已返回，等待首帧法兰/关节反馈，超时=%.1fs",
+            side,
+            float(side_cfg.get("health_timeout_s", 3.0)),
+        )
+        _wait_initial_arm_feedback(channel, arm, side_cfg, side)
         last_feedback_ns = time.perf_counter_ns()
         _set_phase(channel, PHASE_HOLD)
         channel["ready_event"].set()
@@ -415,6 +494,7 @@ def arm_hardware_process(
             stop_event.wait(0.001)
     except BaseException as exc:
         exit_code = 1
+        _set_channel_error(channel, exc)
         channel["fault"].value = True
         _set_phase(channel, PHASE_FAULT_HOLD)
         channel["ready_event"].set()
@@ -472,7 +552,7 @@ def hand_hardware_process(
         from aero_open_sdk.aero_hand import AeroHand
 
         hand = AeroHand(port=side_cfg["hand_port"])
-        _update_hand_feedback(channel, hand)
+        _wait_initial_hand_feedback(channel, hand, side_cfg, side)
         last_feedback_ns = time.perf_counter_ns()
         _set_phase(channel, PHASE_HOLD)
         channel["ready_event"].set()
@@ -558,6 +638,7 @@ def hand_hardware_process(
                 last_feedback_ns = time.perf_counter_ns()
             stop_event.wait(0.001)
     except BaseException as exc:
+        _set_channel_error(channel, exc)
         channel["fault"].value = True
         _set_phase(channel, PHASE_FAULT_HOLD)
         channel["ready_event"].set()
@@ -616,7 +697,10 @@ class MultiprocessRobotProxy:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if bool(channel["fault"].value) and channel["response_queue"].empty():
-                raise RuntimeError(f"{device} 硬件进程处于 fault")
+                detail = _get_channel_error(channel)
+                raise RuntimeError(
+                    f"{device} 硬件进程处于fault: {detail or '未提供详细错误'}"
+                )
             try:
                 response = channel["response_queue"].get(
                     timeout=min(0.1, max(0.001, deadline - time.monotonic()))
@@ -642,7 +726,11 @@ class MultiprocessRobotProxy:
             if remaining <= 0 or not channel["ready_event"].wait(remaining):
                 raise TimeoutError(f"等待 {device} 常驻硬件进程就绪超时")
             if bool(channel["fault"].value):
-                raise RuntimeError(f"{device} 常驻硬件进程启动失败")
+                detail = _get_channel_error(channel)
+                raise RuntimeError(
+                    f"{device} 常驻硬件进程启动失败: "
+                    f"{detail or '未提供详细错误'}"
+                )
         self.state = "idle_enabled"
 
     def home(self) -> None:
@@ -702,7 +790,11 @@ class MultiprocessRobotProxy:
                 channel = self.channels[device]
                 if bool(channel["fault"].value):
                     self.state = "fault_hold_enabled"
-                    raise RuntimeError(f"{device} 硬件进程发生异常")
+                    detail = _get_channel_error(channel)
+                    raise RuntimeError(
+                        f"{device} 硬件进程发生异常: "
+                        f"{detail or '未提供详细错误'}"
+                    )
                 channel["submitted"].value += 1
                 _put_latest_target(
                     channel["target_queue"],
@@ -785,6 +877,7 @@ class MultiprocessRobotProxy:
                 "phase": PHASE_NAMES.get(int(channel["phase"].value), "unknown"),
                 "ready": channel["ready_event"].is_set(),
                 "fault": bool(channel["fault"].value),
+                "error": _get_channel_error(channel),
                 "submitted": int(channel["submitted"].value),
                 "received": int(channel["received"].value),
                 "applied": int(channel["applied"].value),
@@ -869,7 +962,11 @@ class DualArmProcessProxy(MultiprocessRobotProxy):
             channel = self.channels[device]
             if bool(channel["fault"].value):
                 self.state = "fault_hold_enabled"
-                raise RuntimeError(f"{device} 硬件进程发生异常")
+                detail = _get_channel_error(channel)
+                raise RuntimeError(
+                    f"{device} 硬件进程发生异常: "
+                    f"{detail or '未提供详细错误'}"
+                )
             channel["submitted"].value += 1
             _put_latest_target(
                 channel["target_queue"],
