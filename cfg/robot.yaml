@@ -77,9 +77,9 @@ robot:
     # 当前 pysurvive 真机标定：修正旧公式中 VIVE Y 被映射到 Piper Z 的问题。
     # robot_delta = vive_to_robot_matrix @ vive_delta * vive_scale
     vive_to_robot_matrix:
-      - [0, 0, -1]
-      - [0, 1, 0]
-      - [-1, 0, 0]
+      - [ 0.96053416, -0.25591997, 0.10899124 ]
+      - [ 0.26304226, 0.96311646, -0.05670499 ]
+      - [ -0.09045932, 0.08313638, 0.99242403 ]
     initial_pose: [0, 0, 0, 0,0,0]
     # start 时锁定真实法兰姿态，episode 内仅由 VIVE 控制位置，避免首帧姿态跳变。
     orientation_mode: "current_on_start"
@@ -106,9 +106,9 @@ robot:
     hand_home_wait_s: 8
     vive_scale: 0.5
     vive_to_robot_matrix:
-      - [0, 0, -1]
-      - [0, 1, 0]
-      - [-1, 0, 0]
+      - [ 0.98762411, -0.07566333, 0.13738153 ]
+      - [ 0.08825061, 0.99220662, -0.08796506 ]
+      - [ -0.12965514, 0.09900042, 0.98660451 ]
     initial_pose: [0, 0, 0, 0,0,0]
     orientation_mode: "current_on_start"
     # 仅当 orientation_mode=configured_fixed 时使用。
