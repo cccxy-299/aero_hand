@@ -474,18 +474,36 @@ def arm_hardware_process(
                     active = False
                     continue
                 pose = _array(target["target"], (6,), f"{side} move_p target")
+                # started_ns = time.perf_counter_ns()
+                # arm.move_p(pose.tolist())
+                # _update_arm_feedback(
+                #     channel, arm, applied_seq=int(target.get("source_seq", -1))
+                # )
+                # finished_ns = time.perf_counter_ns()
                 started_ns = time.perf_counter_ns()
-                arm.move_p(pose.tolist())
-                _update_arm_feedback(
-                    channel, arm, applied_seq=int(target.get("source_seq", -1))
-                )
+
+                if command_output_enabled:
+                    # 正常实验侧：执行遥操作位置指令。
+                    arm.move_p(pose.tolist())
+                    _update_arm_feedback(
+                        channel,
+                        arm,
+                        applied_seq=int(target.get("source_seq", -1)),
+                    )
+                    channel["applied"].value += 1
+                else:
+                    # 抑制侧仍读取反馈，保持连接、使能和故障诊断；
+                    # 不调用 move_p，也不执行 disable。
+                    _update_arm_feedback(channel, arm)
+
                 finished_ns = time.perf_counter_ns()
+
                 duration_ms = (finished_ns - started_ns) / 1e6
                 channel["last_io_ms"].value = duration_ms
                 channel["max_io_ms"].value = max(
                     float(channel["max_io_ms"].value), duration_ms
                 )
-                channel["applied"].value += 1
+                # channel["applied"].value += 1
                 last_command_ns = started_ns
                 last_feedback_ns = finished_ns
                 now_ns = finished_ns
@@ -559,6 +577,9 @@ def hand_hardware_process(
     )
     _configure_signals(stop_event)
     side_cfg = robot_cfg[side]
+    command_output_enabled = bool(
+        side_cfg.get("command_output_enabled", True)
+    )
     hand = None
     active = False
     last_command_ns = 0

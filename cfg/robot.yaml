@@ -60,6 +60,7 @@ robot:
   worker_stop_timeout_s: 3
   state_stop_timeout_s: 3
   left:
+    command_output_enabled: false
     interface: "socketcan"
     channel: "can_left"
     bitrate: 1000000
@@ -93,6 +94,7 @@ robot:
     max_linear_step_m: 0.01
   right:
     # linux :socketcan can1; windows:agx_cando, 1
+    command_output_enabled: true
     interface: "socketcan"
     channel: "can_right"
     bitrate: 1000000
