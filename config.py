@@ -231,9 +231,19 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         ("arm_command_hz", 30),
         ("arm_feedback_hz", 30),
         ("hand_command_hz", 60),
+        ("hand_feedback_hz", 30),
     ):
         if float(cfg["robot"].get(name, default)) <= 0:
             raise ValueError(f"robot.{name} must be positive")
+    for name, default in (
+        ("hardware_start_timeout_s", 20),
+        ("hardware_request_timeout_s", 30),
+        ("hardware_hold_ack_timeout_s", 0.5),
+    ):
+        if float(cfg["robot"].get(name, default)) <= 0:
+            raise ValueError(f"robot.{name} must be positive")
+    if int(cfg["robot"].get("hardware_command_queue_capacity", 16)) <= 0:
+        raise ValueError("robot.hardware_command_queue_capacity must be positive")
     for name, default in (("min_frames", 10), ("command_queue_capacity", 32)):
         if int(episode.get(name, default)) <= 0:
             raise ValueError(f"episode.{name} must be positive")

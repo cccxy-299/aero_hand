@@ -168,8 +168,8 @@ class LatestCommandWorker:
     def close(self, timeout_s: float = 3.0) -> bool:
         """丢弃未执行命令并等待工作线程退出。
 
-        返回 False 表示线程仍阻塞在硬件 SDK 中。此时上层必须保持机械臂 disable，
-        且不能在同一硬件会话中再次进入 ACTIVE。
+        返回 False 表示线程仍阻塞在硬件 SDK 中。上层不会自动 disable 承重机械臂，
+        但不能在同一硬件会话中再次进入 ACTIVE。
         """
         while True:
             try:
@@ -347,18 +347,15 @@ class DualPiperAerohand:
             f"{side} 侧设备在 {timeout_s:.1f}s 内未返回有效状态: {last_error!r}"
         )
 
-    def _disable_all_arms(self) -> None:
-        for side in ("left", "right"):
-            arm = self.arms.get(side)
-            if arm is None:
-                continue
-            try:
-                arm.disable()
-            except Exception:
-                LOG.exception("%s Piper disable 失败", side)
+    def _hold_all_arms_enabled(self) -> None:
+        """兼容旧调用点：只停止软件下发，绝不自动让机械臂失能。"""
+        LOG.warning(
+            "按配置保持双臂当前使能状态；未调用 arm.disable()。"
+            "承重安全请使用硬件急停/制动保护"
+        )
 
     def initialize(self) -> None:
-        """创建并连接全部硬件，最后确保双臂处于 disable 状态。
+        """旧单进程兼容入口：创建并连接全部硬件，不改变双臂使能状态。
 
         该方法只应在 control 子进程启动时调用一次。任何一侧失败都会回滚已经打开的
         左右臂和灵巧手，禁止以单侧降级方式进入 READY。
@@ -384,7 +381,7 @@ class DualPiperAerohand:
                 ) from exc
 
             try:
-                # 先连接并立即 disable 两台机械臂，避免第二侧初始化期间第一侧保持使能。
+                # 连接时不自动 disable；如果机械臂正在承重，突然失能可能造成跌落。
                 for side in ("left", "right"):
                     side_cfg = self.cfg[side]
                     arm_config = create_agx_arm_config(
@@ -396,10 +393,9 @@ class DualPiperAerohand:
                     )
                     LOG.info("%s Piper 正在连接", side)
                     arm = AgxArmFactory.create_arm(arm_config)
-                    # 先保存句柄，保证 connect/disable 中途失败时 close() 仍能清理。
+                    # 先保存句柄，保证初始化中途失败时仍能报告具体设备。
                     self.arms[side] = arm
                     arm.connect()
-                    arm.disable()
                     arm.set_speed_percent(int(side_cfg.get("speed_percent", 20)))
 
                 for side in ("left", "right"):
@@ -410,7 +406,7 @@ class DualPiperAerohand:
                 for side in ("left", "right"):
                     self._wait_for_feedback(side)
                 self.state = "idle_disabled"
-                LOG.info("双 Piper/双 Aerohand 已连接，双臂保持 disable")
+                LOG.info("双 Piper/双 Aerohand 已连接，未改变双臂当前使能状态")
             except BaseException:
                 self.state = "fault"
                 self.close()
@@ -486,7 +482,7 @@ class DualPiperAerohand:
         )
 
     def home(self) -> None:
-        """显式执行双侧回零；运动完成并校验后再次 disable 双臂。"""
+        """显式执行双侧回零；运动完成并校验后保持双臂 enable。"""
         with self._lifecycle_lock:
             if self.state != "idle_disabled":
                 raise RuntimeError(f"当前状态 {self.state} 不允许 home")
@@ -524,8 +520,7 @@ class DualPiperAerohand:
                             zero_targets[side],
                             float(self.cfg[side].get("home_timeout_s", 10.0)),
                         )
-                        arm.disable()
-                    LOG.info("%s Piper 回零完成并已 disable", side)
+                    LOG.info("%s Piper 回零完成并保持 enable", side)
 
                 for side in ("left", "right"):
                     result = self.hands[side].send_homing()
@@ -541,7 +536,7 @@ class DualPiperAerohand:
                 self.state = "idle_disabled"
             except BaseException:
                 self.homed = False
-                self._disable_all_arms()
+                self._hold_all_arms_enabled()
                 self.state = "fault"
                 raise
 
@@ -550,7 +545,7 @@ class DualPiperAerohand:
 
         该阶段不启动遥操作命令线程。每侧到位后保持 enable，全部完成后才允许
         相机和 episode 继续启动，因此回 home 的运动不会写入训练数据，也不会
-        在正式遥操作前发生一次多余的 disable/enable。
+        在正式遥操作前发生一次多余的使能状态切换。
         """
         with self._lifecycle_lock:
             if self.state != "idle_disabled":
@@ -609,7 +604,7 @@ class DualPiperAerohand:
             except BaseException:
                 self.homed = False
                 self.start_prepared = False
-                self._disable_all_arms()
+                self._hold_all_arms_enabled()
                 self.state = "fault"
                 raise
 
@@ -631,7 +626,7 @@ class DualPiperAerohand:
             try:
                 for side in ("left", "right"):
                     # prepare_start 已保持 enable；这里只切换为遥操作速度，
-                    # 不再执行 disable/enable。
+                    # 不再执行额外使能状态切换。
                     self.arms[side].set_speed_percent(
                         int(self.cfg[side].get("speed_percent", 20))
                     )
@@ -667,7 +662,7 @@ class DualPiperAerohand:
                 self.start_prepared = False
             except BaseException:
                 self.start_prepared = False
-                self._disable_all_arms()
+                self._hold_all_arms_enabled()
                 self.state = "fault"
                 raise
 
@@ -841,7 +836,7 @@ class DualPiperAerohand:
         return result
 
     def deactivate(self) -> None:
-        """episode stop：停止下发并 disable 双臂，保留 CAN/串口硬件会话。"""
+        """episode stop：停止下发，但保持双臂当前使能状态。"""
         with self._lifecycle_lock:
             if self.state in {"new", "closed", "idle_disabled"} and not self.workers:
                 return
@@ -854,13 +849,13 @@ class DualPiperAerohand:
                 ):
                     stuck_workers.append(name)
             self.workers.clear()
-            self._disable_all_arms()
+            self._hold_all_arms_enabled()
             self.start_prepared = False
             self.last_command = None
             if stuck_workers:
                 self.state = "fault"
                 raise RuntimeError(
-                    f"硬件命令线程未及时停止: {stuck_workers}；双臂已 disable，"
+                    f"硬件命令线程未及时停止: {stuck_workers}；双臂未自动 disable，"
                     "当前会话禁止再次 activate"
                 )
             self.state = (
@@ -868,20 +863,15 @@ class DualPiperAerohand:
             )
 
     def close(self) -> None:
-        """进程退出时最终释放全部硬件句柄。"""
+        """旧单进程入口退出：不调用 disable/disconnect，保持机械臂承重。"""
         with self._lifecycle_lock:
             try:
                 self.deactivate()
             except Exception:
                 LOG.exception("机器人 deactivate 失败，继续执行最终硬件释放")
-            self._disable_all_arms()
-        for side in ("left", "right"):
-            arm = self.arms.get(side)
-            if arm is not None:
-                try:
-                    arm.disconnect()
-                except Exception:
-                    LOG.exception("%s Piper 断开失败", side)
+            self._hold_all_arms_enabled()
+        # 不调用 arm.disconnect()：厂商 SDK 是否会在 disconnect 内部隐式
+        # disable 不明确，因此由操作员在确认机械支撑后显式处理。
         self.arms.clear()
         for side, hand in list(self.hands.items()):
             try:

@@ -54,15 +54,18 @@ python -m pip install -r requirements-visualization.txt
 当前入口使用本目录内的模块引用，因此请先进入 `teleop_collect` 目录，再运行设备 A、
 设备 B 或仿真入口。
 
-按 `Ctrl+C` 安全停止；若 episode 正在录制，默认先保存该 episode 再退出。
+按 `Ctrl+C` 会停止软件进程；若 episode 正在录制，默认先保存该 episode 再退出。
+机械臂不会自动 `disable`，会保持控制器当前使能状态和最后目标。该策略用于避免承重
+机械臂突然失能跌落，但不能代替硬件急停、制动器和机械支撑。
 `cfg/robot.yaml` 和 `cfg/operator.yaml` 默认选择真机适配器。
 首次调试建议复制配置并暂时设置 `robot.enabled: false`、`operator.hardware_enabled:
 false` 运行仿真，按照网络 → 相机 → 手 → 机械臂的顺序逐项使能。
 
 ## Episode 人工控制
 
-设备 B 启动时，control 子进程会创建并连接双 Piper/双 Aerohand，完成双侧通信和
-状态检查后立即确保两台机械臂均为 `disable`。CAN/串口会跨 episode 保持连接；
+设备 B 启动时由父进程创建4个常驻硬件进程：`arm_left`、`arm_right`、
+`hand_left`、`hand_right`。每个进程独占一个 SDK 和硬件句柄；control 子进程只做
+UDP、重定向、安全计算及 IPC 协调。启动过程不会自动改变机械臂当前使能状态。
 三路相机仍保持关闭，控制循环也不会启动。在
 `robot_main` 所在终端输入：
 
@@ -76,8 +79,8 @@ status
 quit
 ```
 
-- `home`：不启动相机和 episode；依次低速回零左右 Piper、回零双 Aerohand，
-  校验成功后再次 disable 双臂。
+- `home`：不启动相机和 episode；依次低速移动左右 Piper 到 `home_pose`、回零双
+  Aerohand，校验成功后机械臂保持 enable。
 - `start [可选任务描述]`：开始一个新 episode。
 - `stop`：停止当前 episode，等待三路视频、Parquet 和元数据保存完成。
 - `discard`：丢弃当前 episode，不增加 episode 编号。
@@ -86,26 +89,28 @@ quit
 
 左右 `robot.<side>.home_pose` 必须由操作者按真实安装位置标定为6维关节角。
 收到 `start` 后，系统先以 `home_speed_percent` 依次执行右臂、左臂
-`move_j(home_pose)`，并使用真实关节反馈校验到位；任一侧失败都会 disable 双臂并
-拒绝启动。两侧完成后保持 enable，再启动三路相机，所以回 home 的轨迹不会写进
-episode，也不会在遥操作开始前重复 disable/enable。相机启动期间若收到
-`stop`/`discard` 或启动失败，系统会立即 disable 双臂。
+`move_j(home_pose)`，并使用真实关节反馈校验到位；任一侧失败都会拒绝启动并停止
+继续下发目标，但不会自动 disable 已使能的机械臂。两侧完成后保持 enable，再启动
+三路相机，所以回 home 的轨迹不会写进 episode。相机启动期间收到
+`stop`/`discard` 或启动失败时，双臂同样进入 hold-enabled 状态。
 
 相机全部就绪后，系统在保持 enable 的状态下再次检查硬件，并直接启动状态、控制和
 组帧循环。每个 episode 都以此时读取的真实法兰位姿重新建立 VIVE 参考点和安全
 限速历史，而不是直接把关节 `home_pose` 当作笛卡尔控制目标。`stop`/`discard`
-会立即停止命令工作线程并 disable 双臂，
-灵巧手保持最后位置；相机随之关闭。CAN/串口和硬件 SDK 实例只在 `robot_main`
-退出时最终释放。下一次 `start` 复用硬件会话，但不会复用旧 episode 的命令、图像、
-state、action 或 VIVE 参考。
+会停止4个硬件进程消费新目标，双臂和灵巧手保持最后位置；相机随之关闭。硬件进程
+和 SDK 实例跨 episode 常驻。`robot_main` 异常或正常退出时不会调用机械臂
+`disable()` 或 `disconnect()`，避免厂商 SDK 隐式失能。下一次 `start` 复用硬件
+会话，但不会复用旧 episode 的命令、图像、state、action 或 VIVE 参考。
+机械臂子进程最终使用不执行 Python/SDK 析构器的退出方式，进一步避免未知
+`__del__` 清理逻辑触发隐式失能；控制器固件的通信丢失策略仍需在 Piper 侧确认。
 
 `control_hz` 是安全计算频率，不等于真实硬件命令频率。双臂 `move_p` 默认通过
 `robot.arm_command_hz: 30` 限频，等待期间只保留最新目标；机械臂反馈通过
 `robot.arm_feedback_hz: 30` 限制真实 SDK 读取频率，并采用命令优先的缓存读取，
-避免100Hz状态线程与 `move_p` 争抢同侧 SDK；双手默认通过
-`robot.hand_command_hz: 60` 限频。控制线程不会等待硬件 SDK。运行日志中的
-`hardware.workers` 会输出 `effective_hz`、`dropped` 和 `coalesced`，用于判断
-命令是否过密或 SDK 调用是否变慢。
+避免100Hz状态组帧访问真实 SDK；双手默认通过 `robot.hand_command_hz: 60`
+限频。control 进程不会等待 `move_p` 或串口调用。运行日志中的
+`hardware.devices` 会分别输出4个进程的 `submitted`、`received`、`applied`、
+`applied_seq`、`feedback_age_ms` 和 `last_io_ms`，用于定位某一设备是否阻塞。
 
 保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
 就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。

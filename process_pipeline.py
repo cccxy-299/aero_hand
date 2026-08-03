@@ -103,9 +103,16 @@ def _make_safety(
     return result
 
 
-def _make_robot(cfg: dict[str, Any]) -> Any:
+def _make_robot(
+    cfg: dict[str, Any], hardware_channels: dict[str, Any] | None = None
+) -> Any:
     if bool(cfg["robot"]["enabled"]):
-        # 真机 SDK 只在控制子进程内加载，避免继承 CAN/串口内部状态。
+        if hardware_channels is not None:
+            # 正式多进程路径：control 只持有 IPC 代理，不加载任何硬件 SDK。
+            from hardware_processes import MultiprocessRobotProxy
+
+            return MultiprocessRobotProxy(cfg["robot"], hardware_channels)
+        # 兼容旧单进程入口；正式真机采集不走此分支。
         from hardware_adapters import DualPiperAerohand
 
         return DualPiperAerohand(cfg["robot"])
@@ -184,8 +191,9 @@ def _control_process(
     sample_queue: Any,
     control_queue: Any,
     status_queue: Any,
+    hardware_channels: dict[str, Any] | None = None,
 ) -> None:
-    """控制进程：硬件会话常驻，episode 只切换 enable/disable 与命令线程。"""
+    """控制协调进程：不持有真机 SDK，仅通过 IPC 驱动四个常驻硬件进程。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [device-b/control] %(message)s",
@@ -231,7 +239,7 @@ def _control_process(
             )
             if robot is not None and hardware_state == "prepared_enabled":
                 # start 准备完成后双臂会保持 enable。若用户在相机启动期间
-                # stop/discard，必须立即撤销准备并 disable，不能因 active=False
+                # stop/discard，必须立即撤销准备并进入 hold，不能因 active=False
                 # 而提前返回。
                 robot.deactivate()
                 _status_put(
@@ -306,7 +314,7 @@ def _control_process(
         try:
             # 先完成双臂使能与控制器健康检查，再读取真实法兰反馈。
             # 这与旧方案“机械臂已就绪后 activate_teleop() 建立相对参考”一致，
-            # 避免把 disable 状态下可能滞后的反馈作为首帧控制基准。
+            # 避免把准备前可能滞后的反馈作为首帧控制基准。
             robot.activate()
 
             # 每个 episode 都从 start 后的真实当前位置重新建立 VIVE 参考和
@@ -528,7 +536,7 @@ def _control_process(
 
     try:
         # SDK 对象和 CAN/串口句柄只在本 control 子进程中创建，并跨 episode 常驻。
-        robot = _make_robot(cfg)
+        robot = _make_robot(cfg, hardware_channels)
         _status_put(status_queue, "control", "hardware_initializing")
         robot.initialize()
         _status_put(
@@ -538,7 +546,7 @@ def _control_process(
             hardware=robot.status_snapshot(),
         )
 
-        # 空闲态保留 UDP/时钟同步和已连接但 disable 的机器人硬件。
+        # 空闲态保留 UDP/时钟同步；4个硬件进程继续常驻并保持最后状态。
         receiver = UdpReceiver(
             int(cfg["network"]["data_port"]),
             ClockMapper(),
@@ -1813,6 +1821,11 @@ def run_robot_multiprocess(
     )
     camera_session_active = ctx.Event()
     camera_session_id = ctx.Value("q", 0)
+    hardware_channels: dict[str, Any] | None = None
+    if bool(cfg["robot"].get("enabled", False)):
+        from hardware_processes import create_hardware_channels
+
+        hardware_channels = create_hardware_channels(ctx, cfg["robot"])
     image_shape = (
         int(cfg["cameras"]["height"]),
         int(cfg["cameras"]["width"]),
@@ -1852,9 +1865,42 @@ def run_robot_multiprocess(
         "control": ctx.Process(
             name="device-b-control",
             target=_control_process,
-            args=(cfg, stop_event, sample_queue, control_queue, status_queue),
+            args=(
+                cfg,
+                stop_event,
+                sample_queue,
+                control_queue,
+                status_queue,
+                hardware_channels,
+            ),
         ),
     }
+    if hardware_channels is not None:
+        from hardware_processes import arm_hardware_process, hand_hardware_process
+
+        for side in SIDES:
+            processes[f"arm_{side}"] = ctx.Process(
+                name=f"device-b-arm-{side}",
+                target=arm_hardware_process,
+                args=(
+                    cfg["robot"],
+                    side,
+                    hardware_channels[f"arm_{side}"],
+                    stop_event,
+                    status_queue,
+                ),
+            )
+            processes[f"hand_{side}"] = ctx.Process(
+                name=f"device-b-hand-{side}",
+                target=hand_hardware_process,
+                args=(
+                    cfg["robot"],
+                    side,
+                    hardware_channels[f"hand_{side}"],
+                    stop_event,
+                    status_queue,
+                ),
+            )
     for name in CAMERA_NAMES:
         channel = camera_channel_specs[name]
         processes[f"camera_{name}"] = ctx.Process(
@@ -1963,6 +2009,10 @@ def run_robot_multiprocess(
     old_sigterm = signal.signal(signal.SIGTERM, request_stop)
     console_thread: threading.Thread | None = None
     try:
+        # 四个硬件进程最先启动并跨 episode 常驻；每个进程独占一个 SDK 句柄。
+        for name in ("arm_left", "arm_right", "hand_left", "hand_right"):
+            if name in processes:
+                processes[name].start()
         # 相机服务先启动，但在 session_active 置位前不会连接或采集硬件。
         for name in CAMERA_NAMES:
             processes[f"camera_{name}"].start()
@@ -2016,7 +2066,7 @@ def run_robot_multiprocess(
                             )
                         except queue.Full:
                             LOG.error(
-                                "episode start 被拒绝，但无法提交双臂 disable"
+                                "episode start 被拒绝，但无法提交双臂 hold"
                             )
                 elif str(kind).startswith("control_"):
                     LOG.info("CONTROL %s", json.dumps(status, ensure_ascii=False))
@@ -2051,7 +2101,7 @@ def run_robot_multiprocess(
                                 )
                             except queue.Full:
                                 LOG.error(
-                                    "start 已取消，但无法提交双臂 disable"
+                                    "start 已取消，但无法提交双臂 hold"
                                 )
                         pending_start_task = None
                     elif kind == "control_start_prepare_failed" or (
@@ -2147,6 +2197,10 @@ def run_robot_multiprocess(
         ):
             ipc_queue.close()
             ipc_queue.cancel_join_thread()
+        if hardware_channels is not None:
+            from hardware_processes import close_hardware_channels
+
+            close_hardware_channels(hardware_channels)
         for name, shm in camera_shms.items():
             try:
                 shm.close()

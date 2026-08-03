@@ -47,6 +47,12 @@ robot:
   # 真实反馈最多30Hz访问 SDK；100Hz 状态组帧读取最近完整缓存，命令待处理时让命令优先。
   arm_feedback_hz: 30
   hand_command_hz: 60
+  hand_feedback_hz: 30
+  # 四个常驻硬件进程的生命周期 IPC。stop/异常/退出只进入 hold，不自动 disable。
+  hardware_command_queue_capacity: 16
+  hardware_start_timeout_s: 20
+  hardware_request_timeout_s: 30
+  hardware_hold_ack_timeout_s: 0.5
   # 必须先在终端显式执行 home 并成功，之后才允许 start episode。
   require_home_before_start: true
   worker_stop_timeout_s: 3
