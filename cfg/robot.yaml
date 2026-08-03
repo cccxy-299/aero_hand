@@ -124,6 +124,8 @@ robot:
   hand_min: [0, 0, 0, 0, 0, 0, 0]
   hand_max: [100, 100, 90, 90, 90, 90, 90]
 cameras:
+  # 与 robot.enabled 解耦；可关闭机械臂但保留真实相机，用正式共享内存链路排障。
+  hardware_enabled: true
   width: 640
   height: 480
   wrist_left:

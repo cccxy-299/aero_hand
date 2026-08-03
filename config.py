@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import math
+import logging
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+LOG = logging.getLogger(__name__)
 
 
 def _validate_zmq_network(cfg: dict[str, Any], require_robot_host: bool) -> None:
@@ -84,6 +88,12 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         if side not in cfg["robot"]:
             raise ValueError(f"robot.{side} is required for bimanual control")
         side_cfg = cfg["robot"][side]
+        if "command_output_enabled" in side_cfg and not isinstance(
+            side_cfg["command_output_enabled"], bool
+        ):
+            raise ValueError(
+                f"robot.{side}.command_output_enabled 必须为布尔值"
+            )
         for name in ("initial_pose",):
             value = side_cfg.get(name)
             if not isinstance(value, list) or len(value) != 6:
@@ -184,6 +194,19 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
     for camera in ("scene", "wrist_left", "wrist_right"):
         if camera not in cfg["cameras"]:
             raise ValueError(f"cameras.{camera} is required")
+        if "hardware_enabled" in cfg["cameras"][camera] and not isinstance(
+            cfg["cameras"][camera]["hardware_enabled"], bool
+        ):
+            raise ValueError(
+                f"cameras.{camera}.hardware_enabled 必须为布尔值"
+            )
+    if not isinstance(
+        cfg["cameras"].get(
+            "hardware_enabled", cfg["robot"].get("enabled", False)
+        ),
+        bool,
+    ):
+        raise ValueError("cameras.hardware_enabled 必须为布尔值")
     scene = cfg["cameras"]["scene"]
     if scene.get("driver") != "realsense":
         raise ValueError("cameras.scene.driver 必须为 realsense")
@@ -202,6 +225,26 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
         ):
             raise ValueError(f"cameras.{camera}.device 不能为空")
         wrist_devices.append(str(device))
+        camera_hardware_enabled = bool(
+            wrist.get(
+                "hardware_enabled",
+                cfg["cameras"].get(
+                    "hardware_enabled", cfg["robot"].get("enabled", False)
+                ),
+            )
+        )
+        device_text = str(device)
+        if (
+            camera_hardware_enabled
+            and device_text.startswith("/dev/video")
+            and device_text.removeprefix("/dev/video").isdigit()
+        ):
+            LOG.warning(
+                "cameras.%s.device=%s 是不稳定的枚举路径；正式部署请改为 "
+                "/dev/v4l/by-id/...",
+                camera,
+                device_text,
+            )
         if str(wrist.get("backend", "v4l2")).lower() not in {
             "v4l2",
             "any",

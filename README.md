@@ -205,6 +205,13 @@ quit
 `hardware.devices` 会分别输出4个进程的 `submitted`、`received`、`applied`、
 `applied_seq`、`feedback_age_ms` 和 `last_io_ms`，用于定位某一设备是否阻塞。
 
+三路相机按 `startup_delay_ms` 从小到大严格串行连接；只有上一相机完成
+`connect()` 并发布首帧后才激活下一路。`cameras.hardware_enabled` 与
+`robot.enabled` 相互独立，因此可以关闭机械臂输出，同时仍使用正式的真实相机、
+共享内存和 Recorder 链路排障。用户主动 `quit`/Ctrl+C 时遵循
+`episode.save_on_shutdown`；硬件、相机或 Writer 故障触发的退出一律丢弃当前
+episode，避免保存故障数据。
+
 保存期间状态为 `saving`，此时新的 `start` 会被拒绝，防止上一段视频编码尚未完成
 就混入下一段。`episode.min_frames` 可阻止误触产生过短 episode。
 

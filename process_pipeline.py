@@ -765,18 +765,28 @@ def _make_camera(cfg: dict[str, Any], name: str) -> Any:
     width = int(cameras_cfg["width"])
     height = int(cameras_cfg["height"])
     fps = int(cfg["rates"]["camera_hz"])
-    if bool(cfg["robot"]["enabled"]):
+    camera_cfg = cameras_cfg.get(name, {})
+    hardware_enabled = bool(
+        camera_cfg.get(
+            "hardware_enabled",
+            cameras_cfg.get(
+                "hardware_enabled", cfg["robot"].get("enabled", False)
+            ),
+        )
+    )
+    if hardware_enabled:
         from hardware_adapters import IntelRealSenseColorCamera, OpenCVWristCamera
 
-        if name == "scene":
+        driver = str(camera_cfg.get("driver", "")).lower()
+        if name == "scene" and driver == "realsense":
             return IntelRealSenseColorCamera(
-                cameras_cfg["scene"], "scene", width, height, fps
+                camera_cfg, "scene", width, height, fps
             )
-        if name in {"wrist_left", "wrist_right"}:
+        if name in {"wrist_left", "wrist_right"} and driver == "opencv":
             return OpenCVWristCamera(
-                cameras_cfg[name], name, width, height, fps
+                camera_cfg, name, width, height, fps
             )
-        raise KeyError(f"未知相机名称: {name}")
+        raise ValueError(f"{name} 相机 driver={driver!r} 与设备类型不匹配")
 
     from adapters import SimCamera
 
@@ -786,6 +796,20 @@ def _make_camera(cfg: dict[str, Any], name: str) -> Any:
 def _make_cameras(cfg: dict[str, Any]) -> dict[str, Any]:
     """兼容测试工具；正式采集路径会为每路相机单独创建进程。"""
     return {name: _make_camera(cfg, name) for name in CAMERA_NAMES}
+
+
+def _camera_startup_order(cfg: dict[str, Any]) -> tuple[str, ...]:
+    """按配置顺序键返回严格串行的相机启动次序。"""
+    return tuple(
+        sorted(
+            CAMERA_NAMES,
+            key=lambda camera_name: float(
+                cfg.get("cameras", {})
+                .get(camera_name, {})
+                .get("startup_delay_ms", 0.0)
+            ),
+        )
+    )
 
 
 def _camera_service_process(
@@ -799,6 +823,7 @@ def _camera_service_process(
     frame_lock: Any,
     stop_event: Any,
     session_active: Any,
+    activation_event: Any,
     session_id: Any,
     camera_status_queue: Any,
 ) -> None:
@@ -817,6 +842,14 @@ def _camera_service_process(
     image_view = np.ndarray(image_shape, dtype=np.uint8, buffer=shm.buf)
     episode_cfg = cfg.get("episode", {})
     camera_cfg = cfg.get("cameras", {}).get(name, {})
+    camera_hardware_enabled = bool(
+        camera_cfg.get(
+            "hardware_enabled",
+            cfg.get("cameras", {}).get(
+                "hardware_enabled", cfg["robot"].get("enabled", False)
+            ),
+        )
+    )
     startup_delay_ms = max(
         0.0, float(camera_cfg.get("startup_delay_ms", 0.0))
     )
@@ -857,6 +890,9 @@ def _camera_service_process(
     try:
         while not stop_event.is_set():
             if not session_active.wait(0.2):
+                continue
+            # Recorder 严格按顺序激活相机；不能用固定毫秒延迟假装串行。
+            if not activation_event.wait(0.2):
                 continue
             if stop_event.is_set():
                 break
@@ -976,7 +1012,7 @@ def _camera_service_process(
                         ready_reported = True
                     # 真实相机由 V4L2/RealSense 帧到达自然限速，必须持续排空。
                     # 仿真相机才需要显式等待，避免空转占满 CPU。
-                    if not bool(cfg["robot"]["enabled"]):
+                    if not camera_hardware_enabled:
                         stop_event.wait(
                             1.0 / float(cfg["rates"]["camera_hz"])
                         )
@@ -1086,7 +1122,9 @@ def _recorder_process(
     camera_channel_specs: dict[str, dict[str, Any]],
     camera_status_queue: Any,
     camera_session_active: Any,
+    camera_activation_events: dict[str, Any],
     camera_session_id: Any,
+    graceful_shutdown_event: Any,
 ) -> None:
     """记录进程：控制相机 session，recording 时轮询共享内存并写 episode。"""
     logging.basicConfig(
@@ -1267,46 +1305,55 @@ def _recorder_process(
                 channel["seq"].value = -1
                 channel["stamp_ns"].value = 0
             channel["phase"].value = 0
+        for activation_event in camera_activation_events.values():
+            activation_event.clear()
         with camera_session_id.get_lock():
             camera_session_id.value += 1
             active_camera_session = int(camera_session_id.value)
 
         try:
             camera_session_active.set()
-            # 只有三路相机全部 connect 成功后，才进入 recording 并启动机器人。
+            # 严格逐路连接：下一路只有在上一相机 connect 且发布首帧后才激活。
+            # 这避免 V4L2/RealSense 在 USB 枚举或打开耗时较长时仍发生重叠。
             ready: set[str] = set()
-            deadline = time.monotonic() + float(
-                episode_cfg.get("camera_start_timeout_s", 15)
-            )
-            while ready != set(CAMERA_NAMES):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    missing = sorted(set(CAMERA_NAMES) - ready)
-                    raise TimeoutError(f"相机启动超时，未就绪: {missing}")
-                try:
-                    status = camera_status_queue.get(timeout=min(0.2, remaining))
-                except queue.Empty:
-                    continue
-                if int(status.get("session", -1)) != active_camera_session:
-                    continue
-                if status["kind"] == "ready":
-                    camera_name = str(status["camera"])
-                    ready.add(camera_name)
-                    episode_diagnostics[
-                        f"camera_properties_{camera_name}"
-                    ] = status.get("details", {})
-                    LOG.info(
-                        "%s 相机进程就绪: %s",
-                        camera_name,
-                        status.get("details", {}),
-                    )
-                elif status["kind"] in {"frame_error", "recovered"}:
-                    record_camera_status(status)
-                elif status["kind"] == "error":
-                    record_camera_status(status)
-                    raise RuntimeError(
-                        f"{status['camera']} 相机启动失败: {status.get('error')}"
-                    )
+            timeout_s = float(episode_cfg.get("camera_start_timeout_s", 15))
+            startup_order = _camera_startup_order(cfg)
+            for expected_camera in startup_order:
+                camera_activation_events[expected_camera].set()
+                deadline = time.monotonic() + timeout_s
+                while expected_camera not in ready:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"{expected_camera} 相机启动超时，未收到 ready"
+                        )
+                    try:
+                        status = camera_status_queue.get(
+                            timeout=min(0.2, remaining)
+                        )
+                    except queue.Empty:
+                        continue
+                    if int(status.get("session", -1)) != active_camera_session:
+                        continue
+                    if status["kind"] == "ready":
+                        camera_name = str(status["camera"])
+                        ready.add(camera_name)
+                        episode_diagnostics[
+                            f"camera_properties_{camera_name}"
+                        ] = status.get("details", {})
+                        LOG.info(
+                            "%s 相机进程就绪: %s",
+                            camera_name,
+                            status.get("details", {}),
+                        )
+                    elif status["kind"] in {"frame_error", "recovered"}:
+                        record_camera_status(status)
+                    elif status["kind"] == "error":
+                        record_camera_status(status)
+                        raise RuntimeError(
+                            f"{status['camera']} 相机启动失败: "
+                            f"{status.get('error')}"
+                        )
         except BaseException:
             stop_capture(require_stopped=False)
             raise
@@ -1317,6 +1364,8 @@ def _recorder_process(
             return
         session = active_camera_session
         camera_session_active.clear()
+        for activation_event in camera_activation_events.values():
+            activation_event.clear()
         join_timeout_s = float(
             episode_cfg.get("camera_shutdown_timeout_s", 5)
         )
@@ -1810,7 +1859,11 @@ def _recorder_process(
 
         if writer is not None and writer_thread is not None:
             if episode_state == "recording":
-                finish_episode(save_on_shutdown, "shutdown")
+                graceful = graceful_shutdown_event.is_set()
+                finish_episode(
+                    save_on_shutdown and graceful,
+                    "graceful_shutdown" if graceful else "fault_shutdown",
+                )
             shutdown_deadline = time.monotonic() + float(
                 cfg.get("runtime", {}).get("writer_shutdown_timeout_s", 30)
             )
@@ -1875,7 +1928,9 @@ def run_robot_multiprocess(
         maxsize=int(runtime_cfg.get("status_queue_capacity", 128))
     )
     camera_session_active = ctx.Event()
+    camera_activation_events = {name: ctx.Event() for name in CAMERA_NAMES}
     camera_session_id = ctx.Value("q", 0)
+    graceful_shutdown_event = ctx.Event()
     hardware_channels: dict[str, Any] | None = None
     if bool(cfg["robot"].get("enabled", False)):
         from hardware_processes import create_hardware_channels
@@ -1914,7 +1969,9 @@ def run_robot_multiprocess(
                 camera_channel_specs,
                 camera_status_queue,
                 camera_session_active,
+                camera_activation_events,
                 camera_session_id,
+                graceful_shutdown_event,
             ),
         ),
         "control": ctx.Process(
@@ -1972,6 +2029,7 @@ def run_robot_multiprocess(
                 channel["lock"],
                 stop_event,
                 camera_session_active,
+                camera_activation_events[name],
                 camera_session_id,
                 camera_status_queue,
             ),
@@ -1982,7 +2040,16 @@ def run_robot_multiprocess(
     start_prepare_in_progress = False
     pending_start_task: str | None = None
 
+    def gate_hardware_now() -> None:
+        if hardware_channels is None:
+            return
+        from hardware_processes import gate_hardware_channels
+
+        gate_hardware_channels(hardware_channels)
+
     def request_stop(*_: Any) -> None:
+        graceful_shutdown_event.set()
+        gate_hardware_now()
         stop_event.set()
 
     def submit_episode_command(kind: str, task: str | None = None) -> None:
@@ -2010,6 +2077,9 @@ def run_robot_multiprocess(
             return
         elif kind in {"stop", "discard"}:
             desired_active = False
+            # 不等待 control 进程从同步 home/prepare_start 返回；父进程直接门控
+            # 四个硬件通道，并使所有已排队生命周期请求失效。
+            gate_hardware_now()
         try:
             episode_queue.put_nowait({"kind": kind, "task": task})
         except queue.Full:
@@ -2055,7 +2125,7 @@ def run_robot_multiprocess(
                 # home 只操作已连接的机器人，不启动相机，也不创建 episode。
                 submit_control_command("home")
             elif command in {"quit", "exit", "q"}:
-                stop_event.set()
+                request_stop()
                 return
             elif command:
                 LOG.warning("未知命令：%s", command)
@@ -2082,6 +2152,8 @@ def run_robot_multiprocess(
         end_time = None if run_seconds is None else time.monotonic() + run_seconds
         while not stop_event.is_set():
             if end_time is not None and time.monotonic() >= end_time:
+                graceful_shutdown_event.set()
+                gate_hardware_now()
                 stop_event.set()
                 break
             try:
@@ -2095,6 +2167,7 @@ def run_robot_multiprocess(
                         status.get("component", "runtime"),
                         status.get("error"),
                     )
+                    gate_hardware_now()
                     stop_event.set()
                 elif kind == "ready":
                     LOG.info("%s 子进程已就绪：%s", status.get("process"), status)
@@ -2191,13 +2264,23 @@ def run_robot_multiprocess(
 
             for name, process in processes.items():
                 if process.exitcode is not None and process.exitcode != 0:
+                    detail: str | None = None
+                    if hardware_channels is not None and name in hardware_channels:
+                        from hardware_processes import _get_channel_error
+
+                        detail = _get_channel_error(hardware_channels[name])
                     errors.append(
                         {
                             "process": name,
                             "kind": "error",
-                            "error": f"exitcode={process.exitcode}",
+                            "error": (
+                                f"exitcode={process.exitcode}; hardware_error={detail}"
+                                if detail
+                                else f"exitcode={process.exitcode}"
+                            ),
                         }
                     )
+                    gate_hardware_now()
                     stop_event.set()
                 elif process.exitcode == 0 and not stop_event.is_set():
                     errors.append(
@@ -2210,6 +2293,9 @@ def run_robot_multiprocess(
                     stop_event.set()
     finally:
         camera_session_active.clear()
+        for activation_event in camera_activation_events.values():
+            activation_event.clear()
+        gate_hardware_now()
         stop_event.set()
         shutdown_timeout_s = float(runtime_cfg.get("shutdown_timeout_s", 8))
         # recorder 可能正在编码视频，给它更长的优雅退出时间。

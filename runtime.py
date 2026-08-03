@@ -52,13 +52,30 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, ZmqRe
         )
     if bool(cfg["robot"]["enabled"]):
         # 旧单进程构造路径按需加载；正式 robot_main 不会在父进程加载硬件 SDK。
-        from hardware_adapters import (
-            DualPiperAerohand,
-            IntelRealSenseColorCamera,
-            OpenCVWristCamera,
-        )
-
+        from hardware_adapters import DualPiperAerohand
         robot_adapter = DualPiperAerohand(cfg["robot"])
+        retargeter = HardwareBimanualRetargeter({
+            side: SideRetargetConfig(
+                np.asarray(cfg["robot"][side]["initial_pose"], np.float32),
+                float(cfg["robot"][side].get("vive_scale", 0.6)),
+                np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
+                np.asarray(
+                    cfg["robot"][side]["vive_to_robot_matrix"],
+                    np.float32,
+                ),
+            )
+            for side in ("left", "right")
+        })
+    else:
+        robot_adapter = SimRobot(hand_dof)
+        retargeter = PassthroughRetargeter()
+
+    cameras_hardware_enabled = bool(
+        cameras.get("hardware_enabled", cfg["robot"].get("enabled", False))
+    )
+    if cameras_hardware_enabled:
+        from hardware_adapters import IntelRealSenseColorCamera, OpenCVWristCamera
+
         camera_adapters = {
             "scene": IntelRealSenseColorCamera(
                 cameras["scene"],
@@ -82,34 +99,12 @@ def make_pipeline(cfg: dict, ingest_network: bool) -> tuple[RobotPipeline, ZmqRe
                 int(cfg["rates"]["camera_hz"]),
             ),
         }
-        retargeter = HardwareBimanualRetargeter({
-            side: SideRetargetConfig(
-                np.asarray(cfg["robot"][side]["initial_pose"], np.float32),
-                float(cfg["robot"][side].get("vive_scale", 0.6)),
-                np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
-                np.asarray(
-                    cfg["robot"][side]["vive_to_robot_matrix"],
-                    np.float32,
-                ),
-            )
-            for side in ("left", "right")
-        })
     else:
-        robot_adapter = SimRobot(hand_dof)
         camera_adapters = {
             "scene": SimCamera(cameras["width"], cameras["height"], 0),
             "wrist_left": SimCamera(cameras["width"], cameras["height"], 1),
             "wrist_right": SimCamera(cameras["width"], cameras["height"], 2),
         }
-        retargeter = PassthroughRetargeter()
-        # retargeter = HardwareBimanualRetargeter({
-        #     side: SideRetargetConfig(
-        #         np.asarray(cfg["robot"][side]["initial_pose"], np.float32),
-        #         float(cfg["robot"][side].get("vive_scale", 0.6)),
-        #         np.asarray(cfg["robot"][side]["fixed_orientation"], np.float32),
-        #     )
-        #     for side in ("left", "right")
-        # })
     pipeline = RobotPipeline(
         robot_adapter, camera_adapters, writer, safety, retargeter,
         cfg["rates"], cfg["alignment"], int(cfg["dataset"]["queue_capacity"]),

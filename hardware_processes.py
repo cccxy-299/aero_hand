@@ -44,6 +44,10 @@ PHASE_NAMES = {
 ERROR_TEXT_BYTES = 4096
 
 
+class HardwareRequestCancelled(RuntimeError):
+    """生命周期请求被父进程的紧急门控取消，不代表硬件进程故障。"""
+
+
 def create_hardware_channels(
     ctx: Any,
     cfg: dict[str, Any],
@@ -63,6 +67,9 @@ def create_hardware_channels(
             "ready_event": ctx.Event(),
             # control可跨进程立即置位；即使SDK线程暂时阻塞，也不会再接受后续目标。
             "hold_event": ctx.Event(),
+            # 生命周期命令使用代数取消，避免 stop 与尚未开始处理的 home/
+            # prepare_start 竞态：请求携带提交时的代数，stop 递增代数后旧请求失效。
+            "cancel_generation": ctx.Value("q", 0),
             "fault": ctx.Value("b", False),
             "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
@@ -88,6 +95,7 @@ def create_hardware_channels(
             "response_queue": ctx.Queue(maxsize=capacity),
             "ready_event": ctx.Event(),
             "hold_event": ctx.Event(),
+            "cancel_generation": ctx.Value("q", 0),
             "fault": ctx.Value("b", False),
             "error_text": ctx.Array("B", ERROR_TEXT_BYTES, lock=True),
             "phase": ctx.Value("i", PHASE_STARTING),
@@ -112,6 +120,18 @@ def close_hardware_channels(channels: dict[str, Any]) -> None:
             ipc_queue = channel[name]
             ipc_queue.close()
             ipc_queue.cancel_join_thread()
+
+
+def gate_hardware_channels(
+    channels: dict[str, Any], devices: tuple[str, ...] | None = None
+) -> None:
+    """跨进程立即门控目标，并使正在执行或排队的生命周期请求失效。"""
+    selected = devices or tuple(channels)
+    for device in selected:
+        channel = channels[device]
+        channel["hold_event"].set()
+        with channel["cancel_generation"].get_lock():
+            channel["cancel_generation"].value += 1
 
 
 def _configure_signals(stop_event: Any) -> None:
@@ -290,6 +310,8 @@ def _wait_arm_home(
     side_cfg: dict[str, Any],
     side: str,
     target: np.ndarray,
+    request_generation: int,
+    stop_event: Any,
 ) -> None:
     deadline = time.monotonic() + float(side_cfg.get("home_timeout_s", 10.0))
     tolerance = float(side_cfg.get("home_joint_tolerance_rad", 0.10))
@@ -297,6 +319,12 @@ def _wait_arm_home(
     last_motion: Any = None
     last_error = float("inf")
     while time.monotonic() < deadline:
+        if stop_event.is_set() or int(channel["cancel_generation"].value) != int(
+            request_generation
+        ):
+            raise HardwareRequestCancelled(
+                f"{side} Piper home/prepare_start 已取消"
+            )
         status = arm.get_arm_status()
         message = getattr(status, "msg", status)
         last_motion = getattr(message, "motion_status", None)
@@ -327,6 +355,9 @@ def arm_hardware_process(
     )
     _configure_signals(stop_event)
     side_cfg = robot_cfg[side]
+    command_output_enabled = bool(
+        side_cfg.get("command_output_enabled", True)
+    )
     arm = None
     active = False
     last_command_ns = 0
@@ -393,6 +424,18 @@ def arm_hardware_process(
                     if kind in {"home", "prepare_start"}:
                         channel["hold_event"].set()
                         active = False
+                        request_generation = int(
+                            request.get(
+                                "cancel_generation",
+                                channel["cancel_generation"].value,
+                            )
+                        )
+                        if request_generation != int(
+                            channel["cancel_generation"].value
+                        ):
+                            raise HardwareRequestCancelled(
+                                f"{side} Piper {kind} 在执行前已取消"
+                            )
                         target = _array(
                             side_cfg["home_pose"], (6,), f"{side} home_pose"
                         )
@@ -401,7 +444,15 @@ def arm_hardware_process(
                             int(side_cfg.get("home_speed_percent", 10))
                         )
                         arm.move_j(target.tolist())
-                        _wait_arm_home(arm, channel, side_cfg, side, target)
+                        _wait_arm_home(
+                            arm,
+                            channel,
+                            side_cfg,
+                            side,
+                            target,
+                            request_generation,
+                            stop_event,
+                        )
                         # 到达 home 后保持 enable，不执行 disable。
                         _set_phase(
                             channel,
@@ -445,6 +496,17 @@ def arm_hardware_process(
                         )
                     else:
                         raise RuntimeError(f"未知机械臂命令: {kind}")
+                except HardwareRequestCancelled as exc:
+                    active = False
+                    _set_phase(channel, PHASE_HOLD)
+                    _put_response(
+                        channel,
+                        request,
+                        ok=False,
+                        cancelled=True,
+                        error=str(exc),
+                        arm_disabled=False,
+                    )
                 except BaseException as exc:
                     active = False
                     channel["fault"].value = True
@@ -577,9 +639,6 @@ def hand_hardware_process(
     )
     _configure_signals(stop_event)
     side_cfg = robot_cfg[side]
-    command_output_enabled = bool(
-        side_cfg.get("command_output_enabled", True)
-    )
     hand = None
     active = False
     last_command_ns = 0
@@ -613,12 +672,34 @@ def hand_hardware_process(
                     if kind == "home":
                         channel["hold_event"].set()
                         active = False
+                        request_generation = int(
+                            request.get(
+                                "cancel_generation",
+                                channel["cancel_generation"].value,
+                            )
+                        )
+                        if request_generation != int(
+                            channel["cancel_generation"].value
+                        ):
+                            raise HardwareRequestCancelled(
+                                f"{side} Aerohand home 在执行前已取消"
+                            )
                         result = hand.send_homing()
                         if result is False:
                             raise RuntimeError(f"{side} Aerohand homing 返回失败")
                         wait_s = float(side_cfg.get("hand_home_wait_s", 8.0))
                         if wait_s > 0:
-                            stop_event.wait(wait_s)
+                            deadline = time.monotonic() + wait_s
+                            while time.monotonic() < deadline:
+                                if stop_event.is_set() or int(
+                                    channel["cancel_generation"].value
+                                ) != request_generation:
+                                    raise HardwareRequestCancelled(
+                                        f"{side} Aerohand home 已取消"
+                                    )
+                                stop_event.wait(
+                                    min(0.05, max(0.0, deadline - time.monotonic()))
+                                )
                         _update_hand_feedback(channel, hand)
                         _set_phase(channel, PHASE_HOLD)
                         _put_response(channel, request, ok=True, state="hold")
@@ -650,6 +731,16 @@ def hand_hardware_process(
                         )
                     else:
                         raise RuntimeError(f"未知灵巧手命令: {kind}")
+                except HardwareRequestCancelled as exc:
+                    active = False
+                    _set_phase(channel, PHASE_HOLD)
+                    _put_response(
+                        channel,
+                        request,
+                        ok=False,
+                        cancelled=True,
+                        error=str(exc),
+                    )
                 except BaseException as exc:
                     active = False
                     channel["fault"].value = True
@@ -742,8 +833,14 @@ class MultiprocessRobotProxy:
         channel = self.channels[device]
         self._request_id += 1
         request_id = self._request_id
+        cancel_generation = int(channel["cancel_generation"].value)
         channel["control_queue"].put(
-            {"kind": kind, "request_id": request_id}, timeout=timeout_s
+            {
+                "kind": kind,
+                "request_id": request_id,
+                "cancel_generation": cancel_generation,
+            },
+            timeout=timeout_s,
         )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -761,6 +858,10 @@ class MultiprocessRobotProxy:
             if int(response.get("request_id", -1)) != request_id:
                 continue
             if not bool(response.get("ok", False)):
+                if bool(response.get("cancelled", False)):
+                    raise HardwareRequestCancelled(
+                        f"{device} {kind} 已取消: {response.get('error')}"
+                    )
                 raise RuntimeError(
                     f"{device} {kind} 失败: {response.get('error')}"
                 )
@@ -821,6 +922,11 @@ class MultiprocessRobotProxy:
             self.start_prepared = True
             self.start_home_count += 1
             self.state = "prepared_enabled"
+        except HardwareRequestCancelled:
+            self._best_effort_hold("cancel_prepare")
+            self.start_prepared = False
+            self.state = "idle_enabled"
+            raise
         except BaseException:
             # 不 disable 已经准备成功的机械臂，只停止后续目标并保持使能。
             self._best_effort_hold("cancel_prepare")
@@ -837,6 +943,11 @@ class MultiprocessRobotProxy:
                 self._request(device, "activate", timeout_s)
             self.state = "active"
             self.start_prepared = False
+        except HardwareRequestCancelled:
+            self._best_effort_hold("cancel_prepare")
+            self.start_prepared = False
+            self.state = "idle_enabled"
+            raise
         except BaseException:
             self._best_effort_hold("stop")
             self.state = "fault_hold_enabled"
@@ -905,8 +1016,7 @@ class MultiprocessRobotProxy:
     def _best_effort_hold(self, kind: str = "stop") -> None:
         devices = ("arm_left", "arm_right", "hand_left", "hand_right")
         # 先原子式门控全部设备，再异步通知设备更新phase并清空本地目标。
-        for device in devices:
-            self.channels[device]["hold_event"].set()
+        gate_hardware_channels(self.channels, devices)
         for device in devices:
             self._request_no_wait(device, kind)
 
@@ -987,6 +1097,11 @@ class DualArmProcessProxy(MultiprocessRobotProxy):
             self.start_prepared = True
             self.start_home_count += 1
             self.state = "prepared_enabled"
+        except HardwareRequestCancelled:
+            self._best_effort_hold("cancel_prepare")
+            self.start_prepared = False
+            self.state = "idle_enabled"
+            raise
         except BaseException:
             self._best_effort_hold("cancel_prepare")
             self.start_prepared = False
@@ -1055,7 +1170,6 @@ class DualArmProcessProxy(MultiprocessRobotProxy):
 
     def _best_effort_hold(self, kind: str = "stop") -> None:
         devices = ("arm_left", "arm_right")
-        for device in devices:
-            self.channels[device]["hold_event"].set()
+        gate_hardware_channels(self.channels, devices)
         for device in devices:
             self._request_no_wait(device, kind)
