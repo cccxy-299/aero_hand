@@ -22,7 +22,11 @@ from hardware_processes import (
     create_hardware_channels,
     gate_hardware_channels,
 )
-from process_pipeline import _camera_startup_order, _make_camera
+from process_pipeline import (
+    _camera_frame_advances,
+    _camera_startup_order,
+    _make_camera,
+)
 
 
 class IntegrationRegressionTests(unittest.TestCase):
@@ -52,6 +56,14 @@ class IntegrationRegressionTests(unittest.TestCase):
             _camera_startup_order(cfg),
             ("wrist_left", "wrist_right", "scene"),
         )
+
+    def test_camera_startup_gate_detects_a_frozen_ready_camera(self) -> None:
+        baseline = {"scene": 3, "wrist_left": 17, "wrist_right": 25}
+        latest = {"scene": 33, "wrist_left": 17, "wrist_right": 55}
+        advances = _camera_frame_advances(baseline, latest)
+        self.assertEqual(advances["wrist_left"], 0)
+        self.assertGreaterEqual(advances["scene"], 5)
+        self.assertGreaterEqual(advances["wrist_right"], 5)
 
     def test_real_camera_switch_is_independent_from_robot_switch(self) -> None:
         cfg = {

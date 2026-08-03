@@ -324,11 +324,14 @@ def load_robot_config(path: str | Path) -> dict[str, Any]:
             raise ValueError(f"episode.{name} must be positive")
     for name, default in (
         ("camera_start_timeout_s", 15),
+        ("camera_start_stability_s", 1.0),
         ("camera_shutdown_timeout_s", 5),
         ("camera_failure_timeout_ms", 1500),
     ):
         if float(episode.get(name, default)) <= 0:
             raise ValueError(f"episode.{name} must be positive")
+    if int(episode.get("camera_start_min_new_frames", 5)) <= 0:
+        raise ValueError("episode.camera_start_min_new_frames must be positive")
     if float(episode.get("camera_retry_delay_ms", 10)) < 0:
         raise ValueError("episode.camera_retry_delay_ms must be non-negative")
     if int(episode.get("camera_error_report_interval", 30)) <= 0:

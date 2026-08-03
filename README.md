@@ -379,6 +379,12 @@ python opencv_camera_concurrency_test.py \
 recorder 的每秒 `metrics.cameras` 还会输出各路 `seq`、`last_frame_age_ms` 和
 `phase`，用于区分阻塞发生在 `read`、共享内存发布还是设备释放阶段。
 
+三路相机全部报告 `ready` 后，recorder 还会执行启动稳定性检查。在
+`camera_start_stability_s` 窗口内，每路至少要新增
+`camera_start_min_new_frames` 帧，并且最新帧年龄不能超过该路的
+`failure_timeout_ms`；只有检查通过后才发布 `episode_started` 并放行机械臂控制。
+这样后启动的 USB 相机导致前一路冻结时，不会把历史首帧误判为相机仍然可用。
+
 ## Intel RealSense 全景相机
 
 设备 B 的 `cameras.scene` 使用 `driver: realsense`。单台 RealSense 时可将

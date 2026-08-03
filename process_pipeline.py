@@ -812,6 +812,16 @@ def _camera_startup_order(cfg: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _camera_frame_advances(
+    baseline: dict[str, int], latest: dict[str, int]
+) -> dict[str, int]:
+    """计算稳定性窗口内各相机新增的共享帧数。"""
+    return {
+        name: max(0, int(latest.get(name, -1)) - int(start_seq))
+        for name, start_seq in baseline.items()
+    }
+
+
 def _camera_service_process(
     cfg: dict[str, Any],
     name: str,
@@ -1281,6 +1291,88 @@ def _recorder_process(
                 status.get("total"),
             )
 
+    def camera_snapshot(name: str) -> tuple[int, int, int]:
+        channel = camera_channels[name]
+        with channel["lock"]:
+            seq = int(channel["seq"].value)
+            stamp_ns = int(channel["stamp_ns"].value)
+        return seq, stamp_ns, int(channel["phase"].value)
+
+    def verify_camera_startup_stability() -> None:
+        """确认所有相机在最终启动窗口内持续前进，禁止复用历史首帧。"""
+        stability_s = float(episode_cfg.get("camera_start_stability_s", 1.0))
+        min_new_frames = int(episode_cfg.get("camera_start_min_new_frames", 5))
+        baseline = {name: camera_snapshot(name)[0] for name in CAMERA_NAMES}
+        latest = dict(baseline)
+        deadline = time.monotonic() + stability_s
+        while time.monotonic() < deadline:
+            if stop_event.is_set():
+                raise RuntimeError("相机启动稳定性检查被全局停止信号取消")
+            while True:
+                try:
+                    status = camera_status_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if int(status.get("session", -1)) != active_camera_session:
+                    continue
+                record_camera_status(status)
+                if status.get("kind") == "error":
+                    raise RuntimeError(
+                        f"{status.get('camera')} 相机启动稳定性检查失败: "
+                        f"{status.get('error')}"
+                    )
+                if status.get("kind") == "stopped":
+                    raise RuntimeError(
+                        f"{status.get('camera')} 相机在启动稳定性检查期间停止"
+                    )
+
+            for name in CAMERA_NAMES:
+                seq, stamp_ns, phase = camera_snapshot(name)
+                latest[name] = seq
+                if seq < 0 or stamp_ns <= 0:
+                    raise RuntimeError(f"{name} 相机启动后没有有效共享帧")
+                snapshot_ns = time.perf_counter_ns()
+                camera_cfg = cfg.get("cameras", {}).get(name, {})
+                failure_timeout_ms = float(
+                    camera_cfg.get(
+                        "failure_timeout_ms",
+                        episode_cfg.get("camera_failure_timeout_ms", 1500),
+                    )
+                )
+                frame_age_ms = max(0.0, (snapshot_ns - stamp_ns) / 1e6)
+                if frame_age_ms >= failure_timeout_ms:
+                    phase_name = {
+                        0: "idle",
+                        1: "read",
+                        2: "publish",
+                        3: "disconnect",
+                    }.get(phase, f"unknown({phase})")
+                    raise RuntimeError(
+                        f"{name} 相机在启动阶段已停滞 {frame_age_ms:.1f}ms，"
+                        f"超过阈值 {failure_timeout_ms:.1f}ms；"
+                        f"相机服务阶段={phase_name}"
+                    )
+            stop_event.wait(0.05)
+
+        advances = _camera_frame_advances(baseline, latest)
+        episode_diagnostics["camera_startup_new_frames"] = dict(advances)
+        failures = {
+            name: count
+            for name, count in advances.items()
+            if count < min_new_frames
+        }
+        if failures:
+            raise RuntimeError(
+                "相机启动稳定性检查失败；窗口 "
+                f"{stability_s:.2f}s 内新增帧不足 "
+                f"{min_new_frames}: {failures}"
+            )
+        LOG.info(
+            "三路相机启动稳定性检查通过：window=%.2fs new_frames=%s",
+            stability_s,
+            advances,
+        )
+
     def start_capture() -> None:
         nonlocal active_camera_session
         for buffer in buffers.values():
@@ -1354,6 +1446,7 @@ def _recorder_process(
                             f"{status['camera']} 相机启动失败: "
                             f"{status.get('error')}"
                         )
+            verify_camera_startup_stability()
         except BaseException:
             stop_capture(require_stopped=False)
             raise

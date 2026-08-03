@@ -31,6 +31,9 @@ episode:
   command_queue_capacity: 32
   # start 激活三路同级相机服务；idle 时服务进程存在但不会打开或采集相机。
   camera_start_timeout_s: 15
+  # 三路相机全部 ready 后继续观察一段时间；每路必须持续产生足够的新帧，机械臂控制才会放行。
+  camera_start_stability_s: 1.0
+  camera_start_min_new_frames: 5
   camera_shutdown_timeout_s: 5
   # 瞬时空包/损坏帧只丢当前帧；持续无有效画面超过该时间才停止整个 episode。
   camera_failure_timeout_ms: 2500
